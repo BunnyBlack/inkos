@@ -416,6 +416,18 @@ describe("runAgentSession cache — bookId switch", () => {
     if (otherProjectRoot) await rm(otherProjectRoot, { recursive: true, force: true });
   });
 
+  it("refreshes runtime policy and metadata for an existing conversation", async () => {
+    const model = { provider: "x", id: "generic", api: "openai-completions", reasoning: true, contextWindow: 128000, maxTokens: 8192 } as any;
+    const base = { sessionId: "s1", bookId: null, language: "en", pipeline: {} as any, projectRoot, model };
+    await runAgentSession({ ...base, runtime: { reasoning: "high", thinkingBudget: 2048, temperature: 0.3, maxTokens: 2048 } } as any, "hello");
+    expect(streamCalls.at(-1)?.options).toMatchObject({ reasoning: "high", thinkingBudgets: { high: 2048 }, temperature: 0.3, maxTokens: 2048 });
+    await runAgentSession({ ...base, model: { ...model, maxTokens: 4096 }, runtime: { reasoning: "off", temperature: 0.5 } } as any, "second question");
+    expect(streamCalls.at(-1)?.model.maxTokens).toBe(4096);
+    expect(streamCalls.at(-1)?.options.reasoning).toBeUndefined();
+    expect(streamCalls.at(-1)?.options.temperature).toBe(0.5);
+    expect(JSON.stringify(streamCalls.at(-1)?.context)).toContain("hello");
+  });
+
   it("rebuilds Agent when bookId changes for same sessionId", async () => {
     const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
     const pipeline = {} as any;

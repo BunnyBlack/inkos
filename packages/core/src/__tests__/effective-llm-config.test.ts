@@ -28,6 +28,36 @@ describe("resolveEffectiveLLMConfig", () => {
     await writeFile(join(root, ".inkos", "secrets.json"), JSON.stringify({ services }, null, 2), "utf-8");
   }
 
+  it("applies selected service reasoning policy over top-level defaults", async () => {
+    await writeProject({
+      configSource: "studio",
+      service: "custom:reasoning-local",
+      reasoning: "low",
+      thinkingBudget: 1024,
+      services: [
+        {
+          service: "custom",
+          name: "reasoning-local",
+          baseUrl: "http://127.0.0.1:8100/v1",
+          models: ["arbitrary-model"],
+          reasoning: "high",
+          thinkingBudget: 4096,
+        },
+      ],
+      defaultModel: "arbitrary-model",
+    });
+
+    const result = await resolveEffectiveLLMConfig({
+      consumer: "studio",
+      projectRoot: root,
+      envLayers: { global: {}, project: {}, process: {} },
+      requireApiKey: false,
+    });
+
+    expect(result.llm.reasoning).toBe("high");
+    expect(result.llm.thinkingBudget).toBe(4096);
+  });
+
   it("carries selected service model metadata into effective LLM config", async () => {
     await writeProject({
       configSource: "studio",

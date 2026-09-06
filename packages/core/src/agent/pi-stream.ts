@@ -1,4 +1,5 @@
 import { streamSimple } from "@mariozechner/pi-ai";
+import { runtimeStreamOptions, type LLMRuntimePolicy } from "../llm/runtime.js";
 import type {
   Api,
   AssistantMessageEventStream,
@@ -25,7 +26,9 @@ export function guardedPiStream<TApi extends Api>(
   model: Model<TApi>,
   context: Context,
   options?: SimpleStreamOptions,
+  runtime?: LLMRuntimePolicy,
 ): AssistantMessageEventStream {
+  options = runtimeStreamOptions(model, runtime, options);
   const reservedOutputTokens = Number.isFinite(options?.maxTokens)
     ? options!.maxTokens!
     : Number.isFinite(model.maxTokens)
@@ -39,7 +42,7 @@ export function guardedPiStream<TApi extends Api>(
   });
   const modelCall = beginAgentModelCall();
   const traceHeaders = agentTrajectoryHeaders(model.baseUrl, modelCall, 1, {
-    effort: String(options?.reasoning ?? (model.reasoning ? "enabled" : "disabled")),
+    effort: String(options?.reasoning ?? "disabled"),
   });
   return guardAssistantMessageStream(
     model,

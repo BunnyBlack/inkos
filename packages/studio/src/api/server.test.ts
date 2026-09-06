@@ -5494,8 +5494,12 @@ describe("createStudioServer daemon lifecycle", () => {
       ...projectConfig,
       llm: {
         configSource: "studio",
+        reasoning: "low",
+        thinkingBudget: 1024,
         services: [
-          { service: "custom", name: "CodexForMe", baseUrl: "https://api-vip.codex-for.me/v1", apiFormat: "responses", stream: false },
+          { service: "custom", name: "CodexForMe", baseUrl: "https://api-vip.codex-for.me/v1", apiFormat: "responses", stream: false,
+            reasoning: "high", thinkingBudget: 4096,
+            modelMetadata: { "gpt-5.4": { contextWindowTokens: 65536, maxOutput: 8192, reasoning: true } } },
         ],
       },
     }, null, 2), "utf-8");
@@ -5546,6 +5550,16 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(response.json()).resolves.toMatchObject({
       response: "你好，我在。",
     });
+    expect(resolveServiceModelMock).toHaveBeenCalledWith(
+      "custom:CodexForMe", "gpt-5.4", root, "https://api-vip.codex-for.me/v1", "responses",
+      { "gpt-5.4": { contextWindowTokens: 65536, maxOutput: 8192, reasoning: true } },
+    );
+    expect(createLLMClientMock).toHaveBeenCalledWith(expect.objectContaining({
+      model: "gpt-5.4",
+      reasoning: "high",
+      thinkingBudget: 4096,
+      modelMetadata: { "gpt-5.4": { contextWindowTokens: 65536, maxOutput: 8192, reasoning: true } },
+    }));
   });
 
   it("lets the Studio agent creation path use explicit Ollama models without an API key", async () => {

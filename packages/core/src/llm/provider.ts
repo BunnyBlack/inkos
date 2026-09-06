@@ -1,4 +1,6 @@
 import type { LLMConfig } from "../models/project.js";
+import { encodeRuntimePayload, runtimeStreamOptions, runtimeReasoning, RUNTIME_RESERVED_KEYS, type LLMRuntimePolicy } from "./runtime.js";
+import { resolveModelDescriptor } from "./model-descriptor.js";
 import {
   streamSimple as piStreamSimple,
   completeSimple as piCompleteSimple,
@@ -37,7 +39,6 @@ export interface StreamProgress {
 export type OnStreamProgress = (progress: StreamProgress) => void;
 
 const INKOS_USER_AGENT = "InkOS/1.3.5";
-const UNKNOWN_MODEL_FALLBACK_MAX_TOKENS = 8192 * 3;
 const TRANSIENT_LLM_RETRIES = 2;
 const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 90_000;
@@ -279,6 +280,8 @@ export interface LLMClient {
   readonly stream: boolean;
   readonly proxyUrl?: string;
   readonly _piModel?: PiModel<PiApi>;
+  /** Re-resolve per-call model capability and limits using the same service config. */
+  readonly _resolveModel?: (model: string) => PiModel<PiApi>;
   readonly _apiKey?: string;
   readonly defaults: {
     readonly temperature: number;
@@ -288,12 +291,12 @@ export interface LLMClient {
      */
     readonly maxTokens: number;
     /**
-     * Legacy mock compatibility only. v2 provider resolution no longer caps
-     * per-call maxTokens from project config; model max output comes from the
-     * provider bank.
+     * Legacy mock compatibility only. Project-level caps are no longer used;
+     * output reservations are bounded by the selected model's capacity.
      */
     readonly maxTokensCap?: number | null;
     readonly thinkingBudget: number;
+    readonly reasoning?: LLMRuntimePolicy["reasoning"];
     readonly extra: Record<string, unknown>;
   };
 }
@@ -301,37 +304,19 @@ export interface LLMClient {
 // === Factory ===
 
 export function createLLMClient(config: LLMConfig): LLMClient {
-  // C1 (v2.0.0)：config.maxTokens / maxTokensCap 已删除；defaults.maxTokens 完全从 modelCard 推导。
-  const _earlyCard = lookupModel(config.service ?? "custom", config.model);
-  const configuredModelMetadata = config.modelMetadata?.[config.model];
-  const defaults = {
-    temperature: config.temperature ?? 0.7,
-    maxTokens: configuredModelMetadata?.maxOutput
-      ?? _earlyCard?.maxOutput
-      ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
-    thinkingBudget: config.thinkingBudget ?? 0,
-    extra: config.extra ?? {},
-  };
-
   const apiFormat = config.apiFormat ?? "chat";
   const stream = config.stream ?? true;
-
-  // --- Build pi-ai Model object ---
   const serviceName = config.service ?? "custom";
   const preset = resolveServicePreset(serviceName);
   const inkosProvider = getEndpoint(serviceName);
-  const modelCard = lookupModel(serviceName, config.model);
 
-  const piApi = resolvePiApi(serviceName, config.apiFormat, (inkosProvider?.api ?? preset?.api) as PiApi) as PiApi;
+  const piApi = serviceName === "custom" && config.provider === "anthropic"
+    ? "anthropic-messages"
+    : resolvePiApi(serviceName, config.apiFormat, (inkosProvider?.api ?? preset?.api) as PiApi) as PiApi;
   const baseUrl = config.baseUrl || inkosProvider?.baseUrl || preset?.baseUrl || "";
   const extraHeaders = sanitizeHttpHeaders(config.headers ?? parseEnvHeaders());
-  const compat = piApi === "openai-completions"
-    ? resolveProviderCompat(inkosProvider, baseUrl)
-    : undefined;
 
   const provider = config.provider === "anthropic" ? "anthropic" : "openai";
-  // pi-ai provider 字段：大多数情况 pi-ai 会按 baseUrl 自动嗅探（openrouter.ai / api.z.ai /
-  // api.x.ai / deepseek.com / anthropic.com 等）。这里只列 pi-ai 嗅探不到、需要显式指定的少数情况。
   let piProvider: string;
   if (inkosProvider?.id === "google") piProvider = "google";
   else if (inkosProvider?.id === "zhipu") piProvider = "zai";
@@ -341,27 +326,41 @@ export function createLLMClient(config: LLMConfig): LLMClient {
   else if (inkosProvider?.api === "anthropic-messages") piProvider = "anthropic";
   else piProvider = provider;
 
-  const piModel: PiModel<PiApi> = {
-    id: modelCard?.deploymentName ?? config.model,
-    name: config.model,
-    api: piApi,
-    provider: piProvider,
-    baseUrl,
-    // 注意：piModel.reasoning 是"激活 reasoning 模式"标志（会让 pi-ai 把 system 改成 developer role 等），
-    // 不是"模型能力"标签。只有用户显式配了 thinkingBudget > 0 才启用 reasoning mode。
-    // 千万不要从 lobe abilities.reasoning 自动推导，否则 Moonshot 这类不支持 developer role 的服务
-    // 会把 content 吃掉，只返回 reasoning_content（见 R4 bug 1 诊断）。
-    reasoning: (config.thinkingBudget ?? 0) > 0,
-    input: ["text"] as ("text" | "image")[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: configuredModelMetadata?.contextWindowTokens
-      ?? modelCard?.contextWindowTokens
-      ?? 128_000,
-    maxTokens: configuredModelMetadata?.maxOutput
-      ?? modelCard?.maxOutput
-      ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
-    ...(extraHeaders ? { headers: extraHeaders } : {}),
-    ...(compat ? { compat } : {}),
+  const buildPiModel = (modelId: string): PiModel<PiApi> => {
+    const metadata = config.modelMetadata?.[modelId];
+    const descriptor = resolveModelDescriptor({
+      serviceId: serviceName,
+      modelId,
+      piProvider,
+      metadata,
+    });
+    const compat = piApi === "openai-completions"
+      ? { ...resolveProviderCompat(inkosProvider, baseUrl, serviceName === "custom"), ...metadata?.compat }
+      : undefined;
+
+    return {
+      id: descriptor.bankModel?.deploymentName ?? modelId,
+      name: modelId,
+      api: piApi,
+      provider: piProvider,
+      baseUrl,
+      reasoning: descriptor.reasoning,
+      input: ["text"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: descriptor.contextWindow,
+      maxTokens: descriptor.maxTokens,
+      ...(extraHeaders ? { headers: extraHeaders } : {}),
+      ...(compat ? { compat } : {}),
+    };
+  };
+
+  const piModel = buildPiModel(config.model);
+  const defaults = {
+    temperature: config.temperature ?? 0.7,
+    maxTokens: piModel.maxTokens,
+    thinkingBudget: config.thinkingBudget ?? 0,
+    reasoning: config.reasoning,
+    extra: config.extra ?? {},
   };
 
   return {
@@ -372,6 +371,9 @@ export function createLLMClient(config: LLMConfig): LLMClient {
     stream,
     proxyUrl: config.proxyUrl,
     _piModel: piModel,
+    _resolveModel: (model) => model === config.model || model === piModel.id
+      ? piModel
+      : buildPiModel(model),
     _apiKey: config.apiKey,
     defaults,
   };
@@ -391,12 +393,64 @@ function resolvePiApi(
 function resolveProviderCompat(
   provider: ReturnType<typeof getEndpoint>,
   baseUrl: string,
+  conservativeCustomStore = false,
 ): Record<string, unknown> | undefined {
   const compat = {
+    ...(conservativeCustomStore ? { supportsStore: false } : {}),
     ...(provider?.compat ?? {}),
     ...(baseUrl.includes("generativelanguage.googleapis.com") ? { supportsStore: false } : {}),
   };
   return Object.keys(compat).length > 0 ? compat : undefined;
+}
+interface NativeOpenAICompatDefaults {
+  readonly supportsDeveloperRole: boolean;
+  readonly supportsReasoningEffort: boolean;
+  readonly maxTokensField: "max_tokens" | "max_completion_tokens";
+  readonly thinkingFormat: "openai" | "openrouter" | "zai";
+}
+
+/**
+ * Mirror pi-ai openai-completions endpoint detection for fields that InkOS
+ * must serialize itself on the native transport. Explicit model compat is
+ * merged last and therefore remains authoritative.
+ */
+function detectNativeOpenAICompat(model: PiModel<PiApi>): NativeOpenAICompatDefaults {
+  const provider = model.provider;
+  const baseUrl = model.baseUrl;
+  const isZai = provider === "zai" || baseUrl.includes("api.z.ai");
+  const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+  const isNonStandard = provider === "cerebras"
+    || baseUrl.includes("cerebras.ai")
+    || isGrok
+    || baseUrl.includes("chutes.ai")
+    || baseUrl.includes("deepseek.com")
+    || isZai
+    || provider === "opencode"
+    || baseUrl.includes("opencode.ai");
+
+  return {
+    supportsDeveloperRole: !isNonStandard,
+    supportsReasoningEffort: !isGrok && !isZai,
+    maxTokensField: baseUrl.includes("chutes.ai") ? "max_tokens" : "max_completion_tokens",
+    thinkingFormat: isZai
+      ? "zai"
+      : provider === "openrouter" || baseUrl.includes("openrouter.ai")
+        ? "openrouter"
+        : "openai",
+  };
+}
+
+function resolveNativeOpenAIModel(
+  model: PiModel<PiApi>,
+): PiModel<"openai-completions"> {
+  const chatModel = model as PiModel<"openai-completions">;
+  return {
+    ...chatModel,
+    compat: {
+      ...detectNativeOpenAICompat(model),
+      ...(chatModel.compat ?? {}),
+    },
+  };
 }
 
 function parseEnvHeaders(): Record<string, string> | undefined {
@@ -463,12 +517,10 @@ export class ContextWindowExceededError extends Error {
 }
 
 /** Keys managed by the provider layer — prevent extra from overriding them. */
-const RESERVED_KEYS = new Set(["max_tokens", "temperature", "model", "messages", "stream"]);
-
 function stripReservedKeys(extra: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(extra)) {
-    if (!RESERVED_KEYS.has(key)) result[key] = value;
+    if (!RUNTIME_RESERVED_KEYS.has(key)) result[key] = value;
   }
   return result;
 }
@@ -1076,7 +1128,7 @@ async function chatCompletionViaCustomAnthropicCompatible(
       ...(client._piModel?.headers ?? {}),
       ...traceHeaders,
     }) ?? { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(encodeRuntimePayload(payload, { ...resolvePiModel(client, model), api: "anthropic-messages" }, { ...client.defaults, maxTokens: resolved.maxTokens })),
     signal,
   }, client.proxyUrl);
 
@@ -1200,7 +1252,7 @@ async function chatCompletionViaCustomOpenAICompatible(
     const response = await fetchWithProxy(`${baseUrl.replace(/\/$/, "")}/responses`, {
       method: "POST",
       headers,
-      body: JSON.stringify(payload),
+      body: JSON.stringify(encodeRuntimePayload(payload, resolvePiModel(client, model), { ...client.defaults, maxTokens: resolved.maxTokens })),
       signal,
     }, client.proxyUrl);
     if (!response.ok) {
@@ -1280,28 +1332,34 @@ async function chatCompletionViaCustomOpenAICompatible(
     return { content, usage };
   }
 
+  const nativeModel = resolveNativeOpenAIModel(resolvePiModel(client, model));
+  const nativeCompat = nativeModel.compat;
   const payload: Record<string, unknown> = {
     model,
     messages: [
       ...messages
         .filter((message) => message.role === "system")
-        .map((message) => ({ role: "system", content: message.content })),
+        .map((message) => ({
+          role: nativeModel.reasoning && nativeCompat?.supportsDeveloperRole ? "developer" : "system",
+          content: message.content,
+        })),
       ...buildChatMessages(messages),
     ],
     stream: client.stream,
+    ...(nativeCompat?.supportsStore === true ? { store: false } : {}),
     temperature: resolved.temperature,
-    max_tokens: resolved.maxTokens,
+    [nativeCompat?.maxTokensField ?? "max_completion_tokens"]: resolved.maxTokens,
     ...defaultOpenAIChatExtra(client, model),
     ...extra,
   };
-  if (client.stream) {
+  if (client.stream && nativeCompat?.supportsUsageInStreaming !== false) {
     payload.stream_options = { include_usage: true };
   }
 
   const response = await fetchWithProxy(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(encodeRuntimePayload(payload, nativeModel, { ...client.defaults, maxTokens: resolved.maxTokens })),
     signal,
   }, client.proxyUrl);
   if (!response.ok) {
@@ -1457,14 +1515,17 @@ export async function chatCompletion(
   },
 ): Promise<LLMResponse> {
   if (isLlmStubEnabled()) return Promise.resolve(stubChatCompletion(messages, model));
-  // C1 (v2.0.0)：删除 maxTokensCap 机制。per-call 显式传的 maxTokens 永远不被裁剪。
+  // Per-call policy overrides defaults, within the selected model's capacity.
+  const selectedModel = resolvePiModel(client, model);
+  const requestedMaxTokens = options?.maxTokens ?? (client._resolveModel ? selectedModel.maxTokens : client.defaults.maxTokens);
   const resolved = {
     temperature: clampTemperatureForModel(
       client.service,
       model,
       options?.temperature ?? client.defaults.temperature,
     ),
-    maxTokens: options?.maxTokens ?? client.defaults.maxTokens,
+    maxTokens: Number.isFinite(selectedModel.maxTokens) && selectedModel.maxTokens > 0
+      ? Math.min(requestedMaxTokens, selectedModel.maxTokens) : requestedMaxTokens,
     extra: client.defaults.extra,
   };
   const onStreamProgress = options?.onStreamProgress;
@@ -1478,8 +1539,8 @@ export async function chatCompletion(
       async (attempt) => {
         signal?.throwIfAborted();
         const traceHeaders = agentTrajectoryHeaders(client._piModel?.baseUrl, modelCall, attempt, {
-          effort: client.defaults.thinkingBudget > 0 ? "enabled" : "disabled",
-          ...(client.defaults.thinkingBudget > 0
+          effort: runtimeReasoning(client.defaults) ?? "disabled",
+          ...(runtimeReasoning(client.defaults) && client.defaults.thinkingBudget > 0
             ? { budgetTokens: client.defaults.thinkingBudget }
             : {}),
         });
@@ -1552,11 +1613,11 @@ export async function chatCompletion(
 
 /**
  * Build a pi-ai Model<Api> for a specific per-call model name.
- * The base template comes from client._piModel (created in createLLMClient);
- * we override .id / .name when the caller passes a different model string
- * (e.g. agent overrides).
+ * Factory clients re-resolve the selected model's metadata. Legacy embedders
+ * without a resolver retain the base-template fallback.
  */
 function resolvePiModel(client: LLMClient, model: string): PiModel<PiApi> {
+  if (client._resolveModel) return client._resolveModel(model);
   const base = client._piModel!;
   if (base.id === model) return base;
   return { ...base, id: model, name: model };
@@ -1600,13 +1661,13 @@ async function chatCompletionViaPiAi(
 ): Promise<LLMResponse> {
   const piModel = resolvePiModel(client, model);
   const context = toPiContext(messages);
-  const streamOpts = {
+  const streamOpts = runtimeStreamOptions(piModel, client.defaults, {
     temperature: resolved.temperature,
     maxTokens: resolved.maxTokens,
     apiKey: client._apiKey,
     headers: mergeUserAgent({ ...(piModel.headers ?? {}), ...traceHeaders }),
     signal,
-  };
+  });
 
   if (!client.stream) {
     const response = await piCompleteSimple(piModel, context, streamOpts);

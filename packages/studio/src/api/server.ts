@@ -1638,7 +1638,10 @@ interface ServiceConfigEntry {
   name?: string;
   baseUrl?: string;
   models?: string[];
+  modelMetadata?: import("@actalk/inkos-core").LLMConfig["modelMetadata"];
   temperature?: number;
+  thinkingBudget?: number;
+  reasoning?: import("@actalk/inkos-core").LLMConfig["reasoning"];
   apiFormat?: "chat" | "responses";
   stream?: boolean;
 }
@@ -1774,7 +1777,12 @@ function normalizeServiceEntry(serviceId: string, value: Record<string, unknown>
       name: decodeURIComponent(serviceId.slice("custom:".length)),
       ...(typeof value.baseUrl === "string" && value.baseUrl.length > 0 ? { baseUrl: value.baseUrl } : {}),
       ...(Array.isArray(value.models) ? { models: normalizeServiceModelIds(value.models) } : {}),
+      ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata as ServiceConfigEntry["modelMetadata"] } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+      ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+      ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning))
+        ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] }
+        : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
       ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),
     };
@@ -1786,7 +1794,12 @@ function normalizeServiceEntry(serviceId: string, value: Record<string, unknown>
       ...(typeof value.name === "string" && value.name.length > 0 ? { name: value.name } : {}),
       ...(typeof value.baseUrl === "string" && value.baseUrl.length > 0 ? { baseUrl: value.baseUrl } : {}),
       ...(Array.isArray(value.models) ? { models: normalizeServiceModelIds(value.models) } : {}),
+      ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata as ServiceConfigEntry["modelMetadata"] } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+      ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+      ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning))
+        ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] }
+        : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
       ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),
     };
@@ -1795,7 +1808,12 @@ function normalizeServiceEntry(serviceId: string, value: Record<string, unknown>
   return {
     service: serviceId,
     ...(Array.isArray(value.models) ? { models: normalizeServiceModelIds(value.models) } : {}),
+    ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata as ServiceConfigEntry["modelMetadata"] } : {}),
     ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+    ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+    ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning))
+      ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] }
+      : {}),
     ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
     ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),
   };
@@ -1814,7 +1832,12 @@ function normalizeServiceConfig(raw: unknown): ServiceConfigEntry[] {
         ...(typeof entry.name === "string" && entry.name.length > 0 ? { name: entry.name } : {}),
         ...(typeof entry.baseUrl === "string" && entry.baseUrl.length > 0 ? { baseUrl: entry.baseUrl } : {}),
         ...(Array.isArray(entry.models) ? { models: normalizeServiceModelIds(entry.models) } : {}),
+        ...(entry.modelMetadata !== undefined ? { modelMetadata: entry.modelMetadata as ServiceConfigEntry["modelMetadata"] } : {}),
         ...(typeof entry.temperature === "number" ? { temperature: entry.temperature } : {}),
+        ...(typeof entry.thinkingBudget === "number" ? { thinkingBudget: entry.thinkingBudget } : {}),
+        ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(entry.reasoning))
+          ? { reasoning: entry.reasoning as ServiceConfigEntry["reasoning"] }
+          : {}),
         ...(entry.apiFormat === "chat" || entry.apiFormat === "responses" ? { apiFormat: entry.apiFormat } : {}),
         ...(typeof entry.stream === "boolean" ? { stream: entry.stream } : {}),
       }));
@@ -4708,6 +4731,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // Resolve model — multi-service resolution
       let resolvedModel: ResolvedModel["model"] | undefined;
       let resolvedApiKey: string | undefined;
+      let selectedService: string | undefined;
+      let selectedModel: string | undefined;
+      let selectedEntry: ServiceConfigEntry | undefined;
 
       if (reqService && reqModel) {
         // 1. Frontend explicitly selected a service+model — fail loudly if no key
@@ -4719,9 +4745,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             root,
             await resolveConfiguredServiceBaseUrl(root, reqService),
             configuredEntry?.apiFormat,
+            configuredEntry?.modelMetadata,
           );
           resolvedModel = resolved.model;
           resolvedApiKey = resolved.apiKey;
+          selectedService = reqService;
+          selectedModel = reqModel;
+          selectedEntry = configuredEntry;
         } catch (e: any) {
           const msg = e?.message ?? String(e);
           if (/API key/i.test(msg)) {
@@ -4752,9 +4782,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               root,
               firstService.baseUrl,
               firstService.apiFormat,
+              firstService.modelMetadata,
             );
             resolvedModel = resolved.model;
             resolvedApiKey = resolved.apiKey;
+            selectedService = serviceConfigKey(firstService);
+            selectedModel = defaultModel;
+            selectedEntry = firstService;
           } catch { /* fall through */ }
         }
       }
@@ -4775,9 +4809,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
                   root,
                   await resolveConfiguredServiceBaseUrl(root, svcName),
                   configuredEntry?.apiFormat,
+                  configuredEntry?.modelMetadata,
                 );
                 resolvedModel = resolved.model;
                 resolvedApiKey = resolved.apiKey;
+                selectedService = svcName;
+                selectedModel = textModels[0].id;
+                selectedEntry = configuredEntry;
                 break;
               }
             } catch { /* try next */ }
@@ -4795,20 +4833,21 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
       const model = resolvedModel!;
       const agentApiKey = resolvedApiKey;
-      const configuredEntry = reqService ? await resolveConfiguredServiceEntry(root, reqService) : undefined;
-
-      // Create pipeline with resolved model (so sub_agent tools use the frontend-selected model)
-      // Don't spread config.llm — its baseUrl/provider belong to the old service.
-      // Let createLLMClient resolve baseUrl from the service preset.
-      const pipelineClient = (reqService && reqModel && resolvedModel)
+      // Share the actually selected service metadata and policy with workers.
+      const pipelineClient = (selectedService && selectedModel && resolvedModel)
         ? createLLMClient({
             ...config.llm,
-            service: configuredEntry?.service ?? reqService,
-            model: reqModel,
+            service: selectedEntry?.service ?? selectedService,
+            model: selectedModel,
+            provider: resolvedModel.api === "anthropic-messages" ? "anthropic" : "openai",
             apiKey: resolvedApiKey ?? "",
-            ...(configuredEntry?.apiFormat ? { apiFormat: configuredEntry.apiFormat } : {}),
-            ...(configuredEntry?.stream !== undefined ? { stream: configuredEntry.stream } : {}),
-            baseUrl: configuredEntry?.baseUrl ?? "",
+            modelMetadata: selectedEntry?.modelMetadata,
+            temperature: selectedEntry?.temperature ?? config.llm.temperature,
+            thinkingBudget: selectedEntry?.thinkingBudget ?? config.llm.thinkingBudget,
+            reasoning: selectedEntry?.reasoning ?? config.llm.reasoning,
+            apiFormat: selectedEntry?.apiFormat ?? (resolvedModel.api === "openai-responses" ? "responses" : "chat"),
+            ...(selectedEntry?.stream !== undefined ? { stream: selectedEntry.stream } : {}),
+            baseUrl: selectedEntry?.baseUrl ?? resolvedModel.baseUrl ?? "",
           } as any)
         : client;
       // Only a structured action request can start a production task. Free text
@@ -4824,7 +4863,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
       const pipeline = new PipelineRunner(await buildPipelineConfig({
         client: pipelineClient,
-        model: reqModel ?? config.llm.model,
+        model: selectedModel ?? config.llm.model,
         currentConfig: config,
         sessionIdForSSE: bookSession.sessionId,
         bookIdForSettings: activeBookId ?? undefined,
@@ -4951,8 +4990,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             manualToolAssistantMessage(
               responseText,
               exec,
-              configuredEntry?.service ?? reqService ?? config.llm.provider,
-              reqModel ?? config.llm.model,
+              selectedEntry?.service ?? selectedService ?? config.llm.provider,
+              selectedModel ?? config.llm.model,
             ),
           ], "", manualToolAppendOptions(sessionKind, exec));
           await refreshBookSessionFromTranscript();
@@ -4986,8 +5025,8 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               manualToolAssistantMessage(
                 message,
                 error.exec,
-                configuredEntry?.service ?? reqService ?? config.llm.provider,
-                reqModel ?? config.llm.model,
+                selectedEntry?.service ?? selectedService ?? config.llm.provider,
+                selectedModel ?? config.llm.model,
               ),
             ], "", manualToolAppendOptions(sessionKind, error.exec)).catch(() => undefined);
             await refreshBookSessionFromTranscript().catch(() => undefined);
@@ -5019,6 +5058,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         {
           model,
           apiKey: agentApiKey,
+          runtime: pipelineClient.defaults,
           pipeline,
           ...(backgroundTask
             ? {

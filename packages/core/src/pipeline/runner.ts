@@ -688,6 +688,7 @@ export class PipelineRunner {
     const cacheKey = [
       provider,
       override.baseUrl,
+      override.model,
       apiKeySource,
       `stream:${stream}`,
       `format:${apiFormat}`,
@@ -698,6 +699,7 @@ export class PipelineRunner {
         ? process.env[override.apiKeyEnv] ?? ""
         : base?.apiKey ?? "";
       client = createLLMClient({
+        ...base,
         provider,
         service: base?.service ?? "custom",
         configSource: base?.configSource ?? "env",

@@ -55,6 +55,47 @@ describe("resolveServiceModel", () => {
     vi.unstubAllEnvs();
   });
 
+  it("applies configured metadata to the Main Agent service model", async () => {
+    const result = await resolveServiceModel("custom:local", "arbitrary", root, "http://localhost:8100/v1", "chat", {
+      arbitrary: { contextWindowTokens: 65536, maxOutput: 8192, reasoning: true, compat: { supportsDeveloperRole: false } },
+    });
+    expect(result.model).toMatchObject({ contextWindow: 65536, maxTokens: 8192, reasoning: true, compat: { supportsDeveloperRole: false } });
+  });
+  it("disables optional store by default for custom Chat endpoints", async () => {
+    const result = await resolveServiceModel(
+      "custom:local",
+      "arbitrary-store-model",
+      root,
+      "http://localhost:8100/v1",
+      "chat",
+    );
+
+    expect(result.model.compat).toMatchObject({
+      supportsStore: false,
+    });
+  });
+
+  it("leaves developer-role support unspecified when endpoint metadata does not declare it", async () => {
+    const result = await resolveServiceModel(
+      "custom:local",
+      "arbitrary",
+      root,
+      "http://localhost:8100/v1",
+      "chat",
+      { arbitrary: { reasoning: true } },
+    );
+
+    expect(result.model.compat).not.toHaveProperty("supportsDeveloperRole");
+  });
+
+  it("does not infer developer-role support from reasoning capability", async () => {
+    const result = await resolveServiceModel("custom:local", "arbitrary", root, "http://localhost:8100/v1", "chat", {
+      arbitrary: { reasoning: true },
+    });
+    expect(result.model.reasoning).toBe(true);
+    expect(result.model.compat ?? {}).not.toHaveProperty("supportsDeveloperRole");
+  });
+
   it("resolves built-in service with key from secrets", async () => {
     await mkdir(join(root, ".inkos"), { recursive: true });
     await writeFile(
@@ -97,6 +138,19 @@ describe("resolveServiceModel", () => {
     expect(result.model.provider).toBe("google");
     expect(result.model.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
     expect(result.model.compat).toBeUndefined();
+  });
+
+  it("uses provider-bank limits when Pi does not know the model", async () => {
+    await mkdir(join(root, ".inkos"), { recursive: true });
+    await writeFile(
+      join(root, ".inkos", "secrets.json"),
+      JSON.stringify({ services: { deepseek: { apiKey: "sk-deep" } } }),
+    );
+
+    const result = await resolveServiceModel("deepseek", "deepseek-v4-flash", root);
+
+    expect(result.model.contextWindow).toBe(1_000_000);
+    expect(result.model.maxTokens).toBe(393_216);
   });
 
   it("preserves DeepSeek tool-result bridge compatibility on resolved model", async () => {

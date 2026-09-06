@@ -110,6 +110,7 @@ export async function processTuiAgentInput(params: {
         ? client._piModel
         : { provider: config.llm.provider ?? "openai", modelId: config.llm.model },
       apiKey: client._apiKey,
+      runtime: client.defaults,
       onEvent: (event: any) => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
           params.onTextDelta?.(event.assistantMessageEvent.delta);

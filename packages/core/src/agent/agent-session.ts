@@ -87,6 +87,7 @@ import {
 } from "./skill-tool.js";
 import { opaqueConversationId, runWithAgentTrajectory } from "../llm/agent-trajectory.js";
 import { guardedPiStream } from "./pi-stream.js";
+import type { LLMRuntimePolicy } from "../llm/runtime.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -121,6 +122,8 @@ export interface AgentSessionConfig {
   model: Model<Api> | { provider: string; modelId: string };
   /** Optional API key. When omitted, falls back to env-based key lookup. */
   apiKey?: string;
+  /** Request policy shared with Pipeline/Worker clients. */
+  runtime?: LLMRuntimePolicy;
   /** Allow the read tool to read absolute paths outside projectRoot/books. Defaults to false; set INKOS_AGENT_ALLOW_SYSTEM_READ=1 to enable. */
   allowSystemFileRead?: boolean;
   /** Optional listener for streaming events (for SSE forwarding). */
@@ -374,13 +377,8 @@ function envFlagEnabled(value: string | undefined, defaultValue: boolean): boole
   return defaultValue;
 }
 
-function agentModelIdentity(model: Model<Api>): string {
-  return [
-    model.api,
-    model.provider,
-    model.baseUrl ?? "",
-    model.id,
-  ].join("::");
+function agentModelIdentity(model: Model<Api>, runtime?: LLMRuntimePolicy): string {
+  return JSON.stringify(stableLoopGuardValue({ model, runtime }));
 }
 
 function actionPayloadCacheKey(payload: ActionPayload | undefined): string {
@@ -1169,7 +1167,7 @@ async function runAgentSessionUnlocked(
   });
   const skillResolutionKey = skillResolutionCacheKey(skillResolution);
   const model = resolveModel(config.model);
-  const requestedModelIdentity = agentModelIdentity(model);
+  const requestedModelIdentity = agentModelIdentity(model, config.runtime);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
   const suppressProductionTools = config.suppressProductionTools ?? false;
   const playWorldExists = sessionKind === "play"
@@ -1324,7 +1322,7 @@ async function runAgentSessionUnlocked(
           return localAssistantStopStream(streamModel);
         }
         if (isLlmStubEnabled()) return stubAgentStream(streamModel, context);
-        return guardedPiStream(streamModel, context, options);
+        return guardedPiStream(streamModel, context, options, config.runtime);
       },
       getApiKey: (provider: string) => {
         if (config.apiKey) return config.apiKey;

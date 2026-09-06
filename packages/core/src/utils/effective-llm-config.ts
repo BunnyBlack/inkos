@@ -49,6 +49,8 @@ interface ServiceConfigEntry {
   readonly models?: readonly string[];
   readonly modelMetadata?: unknown;
   readonly temperature?: number;
+  readonly thinkingBudget?: number;
+  readonly reasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   readonly maxTokens?: number;
   readonly apiFormat?: "chat" | "responses";
   readonly stream?: boolean;
@@ -317,6 +319,8 @@ function applyServiceEntry(llm: Record<string, unknown>, entry: ServiceConfigEnt
   else delete llm.modelMetadata;
 
   if (entry.temperature !== undefined) llm.temperature = entry.temperature;
+  if (entry.thinkingBudget !== undefined) llm.thinkingBudget = entry.thinkingBudget;
+  if (entry.reasoning !== undefined) llm.reasoning = entry.reasoning;
   if (entry.apiFormat !== undefined) llm.apiFormat = entry.apiFormat;
   else if (transportDefaults?.apiFormat !== undefined) llm.apiFormat = transportDefaults.apiFormat;
   else llm.apiFormat = resolveServicePreset(entry.service)?.api.startsWith("openai-responses") ? "responses" : "chat";
@@ -363,6 +367,8 @@ function normalizeServiceEntries(raw: unknown): ServiceConfigEntry[] {
         ...(Array.isArray(entry.models) ? { models: normalizeModelIds(entry.models) } : {}),
         ...(entry.modelMetadata !== undefined ? { modelMetadata: entry.modelMetadata } : {}),
         ...(typeof entry.temperature === "number" ? { temperature: entry.temperature } : {}),
+        ...(typeof entry.thinkingBudget === "number" ? { thinkingBudget: entry.thinkingBudget } : {}),
+        ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(entry.reasoning)) ? { reasoning: entry.reasoning as ServiceConfigEntry["reasoning"] } : {}),
         ...(typeof entry.maxTokens === "number" ? { maxTokens: entry.maxTokens } : {}),
         ...(entry.apiFormat === "chat" || entry.apiFormat === "responses" ? { apiFormat: entry.apiFormat } : {}),
         ...(typeof entry.stream === "boolean" ? { stream: entry.stream } : {}),
@@ -387,6 +393,8 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
       ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
       ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+      ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+      ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning)) ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] } : {}),
       ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
       ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),
@@ -401,6 +409,8 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
       ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
       ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+      ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+      ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning)) ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] } : {}),
       ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
       ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),
@@ -412,6 +422,8 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
     ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
     ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
     ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
+    ...(typeof value.thinkingBudget === "number" ? { thinkingBudget: value.thinkingBudget } : {}),
+    ...(["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(value.reasoning)) ? { reasoning: value.reasoning as ServiceConfigEntry["reasoning"] } : {}),
     ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
     ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
     ...(typeof value.stream === "boolean" ? { stream: value.stream } : {}),

@@ -55,6 +55,7 @@ export const agentCommand = new Command("agent")
             ? client._piModel
             : { provider: config.llm.provider ?? "openai", modelId: config.llm.model },
           apiKey: client._apiKey,
+          runtime: client.defaults,
         },
         fullInstruction,
       );

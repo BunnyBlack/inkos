@@ -167,8 +167,10 @@ describe("Pi worker harness", () => {
       return stream;
     });
 
+    const configuredClient = client();
+    Object.assign(configuredClient.defaults, { reasoning: "high", thinkingBudget: 2048, temperature: 0.4 });
     const result = await runWorkerAgentTool(
-      client(),
+      configuredClient,
       "deepseek-v4-flash",
       [{ role: "user", content: "登记当前角色状态" }],
       {
@@ -184,5 +186,6 @@ describe("Pi worker harness", () => {
 
     expect(result).toEqual({ label: "母亲", status: "等待退烧药" });
     expect(guardedPiStreamMock).toHaveBeenCalledTimes(1);
+    expect(guardedPiStreamMock.mock.calls[0]?.[3]).toMatchObject({ reasoning: "high", thinkingBudget: 2048, temperature: 0.4, maxTokens: 4096 });
   });
 });

@@ -44,6 +44,7 @@ vi.mock("@actalk/inkos-core", async () => {
         maxTokens: 8192,
       },
       _apiKey: "secret",
+      defaults: { temperature: 0.3, maxTokens: 8192, reasoning: "high", thinkingBudget: 2048, extra: {} },
     })),
     PipelineRunner: PipelineRunnerMock as any,
     runAgentSession: runAgentSessionMock,
@@ -109,6 +110,7 @@ describe("tui agent session bridge", () => {
         sessionId: session.sessionId,
         bookId: "harbor",
         projectRoot,
+        runtime: { temperature: 0.3, maxTokens: 8192, reasoning: "high", thinkingBudget: 2048, extra: {} },
       }),
       "帮我整理这一章",
       [

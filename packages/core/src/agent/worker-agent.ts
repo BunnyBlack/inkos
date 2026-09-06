@@ -41,6 +41,7 @@ export interface WorkerResultTool<TParameters extends TSchema> {
 const EMPTY_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 function workerModel(client: LLMClient, modelId: string, maxTokens?: number): Model<Api> {
+  if (client._resolveModel) return client._resolveModel(modelId);
   const base = client._piModel;
   if (base) {
     return base.id === modelId ? base : { ...base, id: modelId, name: modelId };
@@ -347,7 +348,7 @@ export async function runWorkerAgentTool<TParameters extends TSchema>(
           ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
           ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
           signal: combineSignals(streamOptions?.signal, options.signal),
-        }),
+        }, { ...client.defaults, ...(client._resolveModel ? { maxTokens: model.maxTokens } : {}) }),
     getApiKey: () => client._apiKey,
   });
   const abortAgent = () => agent.abort();

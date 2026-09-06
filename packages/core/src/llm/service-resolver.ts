@@ -1,9 +1,10 @@
-import { getModel } from "@mariozechner/pi-ai";
 import type { Model, Api } from "@mariozechner/pi-ai";
+import { resolveModelDescriptor } from "./model-descriptor.js";
 import { resolveServicePiProvider, resolveServicePreset } from "./service-presets.js";
 import { getServiceApiKey } from "./secrets.js";
 import { getEndpoint } from "./providers/index.js";
 import type { InkosEndpoint } from "./providers/types.js";
+import type { LLMConfig } from "../models/project.js";
 import { isApiKeyOptionalForEndpoint } from "../utils/llm-endpoint-auth.js";
 
 export interface ResolvedModel {
@@ -17,8 +18,10 @@ export interface ResolvedModel {
 function resolveProviderCompat(
   provider: InkosEndpoint | undefined,
   baseUrl: string,
+  conservativeCustomStore = false,
 ): Record<string, unknown> | undefined {
   const compat = {
+    ...(conservativeCustomStore ? { supportsStore: false } : {}),
     ...(provider?.compat ?? {}),
     ...(baseUrl.includes("generativelanguage.googleapis.com") ? { supportsStore: false } : {}),
   };
@@ -31,6 +34,7 @@ export async function resolveServiceModel(
   projectRoot: string,
   customBaseUrl?: string,
   customApiFormat?: "chat" | "responses",
+  modelMetadata?: LLMConfig["modelMetadata"],
 ): Promise<ResolvedModel> {
   // Determine pi-ai provider
   const baseService = service.startsWith("custom:") ? "custom" : service;
@@ -41,15 +45,17 @@ export async function resolveServiceModel(
     ? (customApiFormat === "responses" ? "openai-responses" : "openai-completions")
     : (preset?.api ?? "openai-completions");
   const configuredBaseUrl = customBaseUrl ?? preset?.baseUrl ?? "";
-  const endpointModel = baseService === "minimax"
-    ? endpoint?.models.find((model) => model.id === modelId || model.deploymentName === modelId)
-    : undefined;
-
-  // Get pi-ai Model — may return undefined for model IDs not in the built-in registry
-  const piModel = getModel(piProvider as any, modelId as any) as Model<Api> | undefined;
+  const metadata = modelMetadata?.[modelId];
+  const descriptor = resolveModelDescriptor({
+    serviceId: baseService,
+    modelId,
+    piProvider,
+    metadata,
+  });
+  const piModel = descriptor.registryModel;
   const effectiveBaseUrl = configuredBaseUrl || piModel?.baseUrl || "";
   const compat = apiType === "openai-completions"
-    ? resolveProviderCompat(endpoint, effectiveBaseUrl)
+    ? { ...resolveProviderCompat(endpoint, effectiveBaseUrl, baseService === "custom"), ...metadata?.compat }
     : undefined;
 
   if (!effectiveBaseUrl) {
@@ -73,11 +79,11 @@ export async function resolveServiceModel(
     api: apiType as Api,
     provider: piProvider,
     baseUrl: effectiveBaseUrl,
-    reasoning: piModel?.reasoning ?? false,
+    reasoning: descriptor.reasoning,
     input: piModel?.input ?? ["text"] as ("text" | "image")[],
     cost: piModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: endpointModel?.contextWindowTokens ?? piModel?.contextWindow ?? 0,
-    maxTokens: endpointModel?.maxOutput ?? piModel?.maxTokens ?? 16384,
+    contextWindow: descriptor.contextWindow,
+    maxTokens: descriptor.maxTokens,
     ...(compat ? { compat: compat as Model<Api>["compat"] } : {}),
   };
 

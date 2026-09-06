@@ -1,14 +1,30 @@
 import { z } from "zod";
 
+const LLMReasoningSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
 const LLMModelMetadataEntrySchema = z.object({
   contextWindowTokens: z.number().int().positive().optional(),
   maxOutput: z.number().int().positive().optional(),
+  reasoning: z.boolean().optional(),
+  compat: z.object({
+    supportsDeveloperRole: z.boolean().optional(),
+    supportsReasoningEffort: z.boolean().optional(),
+    supportsStore: z.boolean().optional(),
+    supportsUsageInStreaming: z.boolean().optional(),
+    maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
+    // These are pi-ai protocol encoding labels, never model-name selectors.
+    thinkingFormat: z.enum(["openai", "openrouter", "zai", "qwen", "qwen-chat-template"]).optional(),
+    reasoningEffortMap: z.object({
+      minimal: z.string().optional(), low: z.string().optional(), medium: z.string().optional(),
+      high: z.string().optional(), xhigh: z.string().optional(),
+    }).optional(),
+  }).optional(),
 }).refine(
-  (value) => value.contextWindowTokens !== undefined || value.maxOutput !== undefined,
-  { message: "model metadata must define contextWindowTokens or maxOutput" },
+  (value) => Object.values(value).some((field) => field !== undefined),
+  { message: "model metadata must define at least one capability, limit or compatibility field" },
 );
 
-const LLMModelMetadataSchema = z.record(z.string().min(1), LLMModelMetadataEntrySchema);
+export const LLMModelMetadataSchema = z.record(z.string().min(1), LLMModelMetadataEntrySchema);
 
 // C1 (v2.0.0 breaking): `maxTokens` 字段已被 providers bank 接管；zod 用 strip mode 静默丢弃老配置里的 `maxTokens`。
 const LLMServiceEntrySchema = z.object({
@@ -18,6 +34,8 @@ const LLMServiceEntrySchema = z.object({
   models: z.array(z.string().min(1)).optional(),
   modelMetadata: LLMModelMetadataSchema.optional(),
   temperature: z.number().min(0).max(2).optional(),
+  thinkingBudget: z.number().int().min(0).optional(),
+  reasoning: LLMReasoningSchema.optional(),
   apiFormat: z.enum(["chat", "responses"]).optional(),
   stream: z.boolean().optional(),
 });
@@ -42,6 +60,7 @@ export const LLMConfigSchema = z.object({
   modelMetadata: LLMModelMetadataSchema.optional(),
   temperature: z.number().min(0).max(2).default(0.7),
   thinkingBudget: z.number().int().min(0).default(0),
+  reasoning: LLMReasoningSchema.optional(),
   extra: z.record(z.unknown()).optional(),
   headers: z.record(z.string()).optional(),
   apiFormat: z.enum(["chat", "responses"]).default("chat"),
