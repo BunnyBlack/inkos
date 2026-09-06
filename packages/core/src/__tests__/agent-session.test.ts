@@ -81,7 +81,125 @@ vi.mock("@mariozechner/pi-ai", async () => {
     const prompt = lastVisibleUserText(context.messages);
     const allUserText = allVisibleUserText(context.messages);
     const timestamp = Date.now();
-    const message = last?.role === "toolResult"
+    const repeatSameSubAgent = allUserText.includes("repeat same subagent");
+    const previousSubAgentCalls = context.messages.reduce(
+      (count: number, candidate: any) => count + (
+        candidate?.role === "assistant" && Array.isArray(candidate.content)
+          ? candidate.content.filter(
+              (block: any) => block?.type === "toolCall" && block.name === "sub_agent",
+            ).length
+          : 0
+      ),
+      0,
+    );
+    const lastUserIndex = context.messages
+      .map((candidate: any) => candidate?.role)
+      .lastIndexOf("user");
+    const currentTurnSubAgentCalls = context.messages
+      .slice(lastUserIndex + 1)
+      .reduce(
+        (count: number, candidate: any) => count + (
+          candidate?.role === "assistant" && Array.isArray(candidate.content)
+            ? candidate.content.filter(
+                (block: any) => block?.type === "toolCall" && block.name === "sub_agent",
+              ).length
+            : 0
+        ),
+        0,
+      );
+    const repeatTwicePerTurn = prompt === "repeat twice per turn";
+    const currentTurnReadCalls = context.messages
+      .slice(lastUserIndex + 1)
+      .reduce(
+        (count: number, candidate: any) => count + (
+          candidate?.role === "assistant" && Array.isArray(candidate.content)
+            ? candidate.content.filter(
+                (block: any) => block?.type === "toolCall" && block.name === "read",
+              ).length
+            : 0
+        ),
+        0,
+      );
+    const interleavedSubAgents = prompt === "interleave subagent and read";
+    const nineDistinctSubAgents = prompt === "nine distinct subagents";
+    const message = interleavedSubAgents
+      ? currentTurnSubAgentCalls < 2
+        ? assistant([
+            {
+              type: "toolCall",
+              id: `interleave-same-${currentTurnSubAgentCalls + 1}`,
+              name: "sub_agent",
+              arguments: { agent: "writer", instruction: "same interleaved delegation" },
+            },
+          ], timestamp)
+        : currentTurnReadCalls < 1
+          ? assistant([
+              {
+                type: "toolCall",
+                id: "interleave-read",
+                name: "read",
+                arguments: { path: "book-a/story/story_bible.md" },
+              },
+            ], timestamp)
+          : currentTurnSubAgentCalls < 3
+            ? assistant([
+                {
+                  type: "toolCall",
+                  id: "interleave-same-3",
+                  name: "sub_agent",
+                  arguments: { agent: "writer", instruction: "same interleaved delegation" },
+                },
+              ], timestamp)
+            : currentTurnSubAgentCalls < 9
+              ? assistant([
+                  {
+                    type: "toolCall",
+                    id: `interleave-distinct-${currentTurnSubAgentCalls + 1}`,
+                    name: "sub_agent",
+                    arguments: {
+                      agent: "writer",
+                      instruction: `interleave-distinct-${currentTurnSubAgentCalls + 1}`,
+                    },
+                  },
+                ], timestamp)
+              : assistant([{ type: "text", text: "interleave finished" }], timestamp)
+      : nineDistinctSubAgents
+      ? currentTurnSubAgentCalls < 9
+        ? assistant([
+            {
+              type: "toolCall",
+              id: `hop-${currentTurnSubAgentCalls + 1}`,
+              name: "sub_agent",
+              arguments: {
+                agent: "writer",
+                instruction: `distinct-hop-${currentTurnSubAgentCalls + 1}`,
+              },
+            },
+          ], timestamp)
+        : assistant([{ type: "text", text: "hop limit finished" }], timestamp)
+      : repeatTwicePerTurn
+      ? currentTurnSubAgentCalls < 2
+        ? assistant([
+            {
+              type: "toolCall",
+              id: `turn-repeat-${streamCalls.length}`,
+              name: "sub_agent",
+              arguments: { agent: "writer", instruction: "same per-turn delegation" },
+            },
+          ], timestamp)
+        : assistant([{ type: "text", text: "turn finished" }], timestamp)
+      : repeatSameSubAgent
+      ? previousSubAgentCalls < 3
+        ? assistant([
+            {
+              type: "toolCall",
+              id: `repeat-${previousSubAgentCalls + 1}`,
+              name: "sub_agent",
+              arguments: { agent: "writer", instruction: "same delegation" },
+            },
+          ], timestamp)
+        : assistant([{ type: "text", text: "loop finished" }], timestamp)
+      : last?.role === "toolResult"
       ? assistant([{ type: "text", text: "ok" }], timestamp)
       : prompt === "model error"
         ? {
@@ -1018,6 +1136,158 @@ describe("runAgentSession cache — bookId switch", () => {
         expect.objectContaining({ role: "toolResult", toolName: "sub_agent" }),
       ]),
     );
+  });
+
+  it("blocks the third consecutive identical sub_agent delegation", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {
+      runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
+      writeNextChapter: vi.fn(async () => ({
+        chapterNumber: 1,
+        title: "Loop Test",
+        wordCount: 1200,
+        status: "ready-for-review",
+      })),
+    } as any;
+
+    const result = await runAgentSession(
+      {
+        sessionId: "s1",
+        bookId: "book-a",
+        sessionKind: "book",
+        language: "zh",
+        pipeline,
+        projectRoot,
+        model,
+      },
+      "repeat same subagent",
+    );
+
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(2);
+    expect(result.responseText).toBe("loop finished");
+    expect(streamCalls).toHaveLength(4);
+  });
+
+  it("resets the sub_agent repeat guard for each user turn", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {
+      runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
+      writeNextChapter: vi.fn(async () => ({
+        chapterNumber: 1,
+        title: "Turn Reset",
+        wordCount: 1200,
+        status: "ready-for-review",
+      })),
+    } as any;
+
+    const config = {
+      sessionId: "s1",
+      bookId: "book-a",
+      sessionKind: "book" as const,
+      language: "zh",
+      pipeline,
+      projectRoot,
+      model,
+    };
+
+    const first = await runAgentSession(config, "repeat twice per turn");
+    expect(first.responseText).toBe("turn finished");
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(2);
+
+    const second = await runAgentSession(config, "repeat twice per turn");
+    expect(second.responseText).toBe("turn finished");
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(4);
+  });
+
+  it("blocks the ninth sub_agent hop in one user turn", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {
+      runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
+      writeNextChapter: vi.fn(async () => ({
+        chapterNumber: 1,
+        title: "Hop Test",
+        wordCount: 1200,
+        status: "ready-for-review",
+      })),
+    } as any;
+
+    const result = await runAgentSession(
+      {
+        sessionId: "s1",
+        bookId: "book-a",
+        sessionKind: "book",
+        language: "zh",
+        pipeline,
+        projectRoot,
+        model,
+      },
+      "nine distinct subagents",
+    );
+
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(8);
+    expect(result.responseText).toBe("hop limit finished");
+    expect(streamCalls).toHaveLength(10);
+  });
+
+  it("breaks the repeat streak on another tool without resetting total sub_agent hops", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {
+      runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
+      writeNextChapter: vi.fn(async () => ({
+        chapterNumber: 1,
+        title: "Interleave Test",
+        wordCount: 1200,
+        status: "ready-for-review",
+      })),
+    } as any;
+
+    const result = await runAgentSession(
+      {
+        sessionId: "s1",
+        bookId: "book-a",
+        sessionKind: "book",
+        language: "zh",
+        pipeline,
+        projectRoot,
+        model,
+      },
+      "interleave subagent and read",
+    );
+
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(8);
+    expect(result.responseText).toBe("interleave finished");
+    expect(streamCalls).toHaveLength(11);
+  });
+
+  it("resets the total sub_agent hop budget for each user turn", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {
+      runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
+      writeNextChapter: vi.fn(async () => ({
+        chapterNumber: 1,
+        title: "Total Reset",
+        wordCount: 1200,
+        status: "ready-for-review",
+      })),
+    } as any;
+
+    const config = {
+      sessionId: "s1",
+      bookId: "book-a",
+      sessionKind: "book" as const,
+      language: "zh",
+      pipeline,
+      projectRoot,
+      model,
+    };
+
+    const first = await runAgentSession(config, "nine distinct subagents");
+    expect(first.responseText).toBe("hop limit finished");
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(8);
+
+    const second = await runAgentSession(config, "nine distinct subagents");
+    expect(second.responseText).toBe("hop limit finished");
+    expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(16);
   });
 
   it("treats failed production tool results as terminal instead of improvising another write path", async () => {

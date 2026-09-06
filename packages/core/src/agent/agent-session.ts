@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Agent } from "@mariozechner/pi-agent-core";
-import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
 import { getModel, getEnvApiKey, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import type {
   Model,
@@ -173,6 +173,118 @@ export interface AgentSessionAttachment {
 // Cache
 // ---------------------------------------------------------------------------
 
+const MAX_CONSECUTIVE_IDENTICAL_SUB_AGENT_DELEGATIONS = 2;
+const MAX_SUB_AGENT_HOPS_PER_TURN = 8;
+
+interface SubAgentLoopGuardState {
+  lastSignature: string | null;
+  consecutiveIdenticalCalls: number;
+  totalCalls: number;
+}
+
+function createSubAgentLoopGuardState(): SubAgentLoopGuardState {
+  return {
+    lastSignature: null,
+    consecutiveIdenticalCalls: 0,
+    totalCalls: 0,
+  };
+}
+
+function resetSubAgentRepeatGuard(state: SubAgentLoopGuardState): void {
+  state.lastSignature = null;
+  state.consecutiveIdenticalCalls = 0;
+}
+
+function resetSubAgentLoopGuard(state: SubAgentLoopGuardState): void {
+  resetSubAgentRepeatGuard(state);
+  state.totalCalls = 0;
+}
+
+function stableLoopGuardValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableLoopGuardValue);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, stableLoopGuardValue(item)]),
+    );
+  }
+
+  return value;
+}
+
+function subAgentDelegationSignature(params: unknown): string {
+  return JSON.stringify(stableLoopGuardValue(params)) ?? String(params);
+}
+
+function applySubAgentLoopGuard(
+  tools: readonly AgentTool<any>[],
+  state: SubAgentLoopGuardState,
+): AgentTool<any>[] {
+  return tools.map((tool) => {
+    const guarded: AgentTool<any> = {
+      ...tool,
+      execute: async (...args: Parameters<AgentTool<any>["execute"]>) => {
+        const params = args[1];
+
+        if (tool.name !== "sub_agent") {
+          resetSubAgentRepeatGuard(state);
+          return tool.execute(...args);
+        }
+
+        state.totalCalls += 1;
+
+        if (state.totalCalls > MAX_SUB_AGENT_HOPS_PER_TURN) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                "Sub-agent loop guard triggered: this user turn already requested " +
+                "8 sub_agent delegations. Review the existing tool results and " +
+                "choose a non-sub_agent action or produce the final response.",
+            }],
+            details: undefined,
+            isError: true,
+          };
+        }
+
+        const signature = subAgentDelegationSignature(params);
+
+        if (signature === state.lastSignature) {
+          state.consecutiveIdenticalCalls += 1;
+        } else {
+          state.lastSignature = signature;
+          state.consecutiveIdenticalCalls = 1;
+        }
+
+        if (
+          state.consecutiveIdenticalCalls >
+          MAX_CONSECUTIVE_IDENTICAL_SUB_AGENT_DELEGATIONS
+        ) {
+          return {
+            content: [{
+              type: "text",
+              text:
+                "Sub-agent loop guard triggered: the same delegation was requested " +
+                "more than 2 consecutive times. Review the existing sub_agent results " +
+                "and choose a different action or produce the final response.",
+            }],
+            details: undefined,
+            isError: true,
+          };
+        }
+
+        return tool.execute(...args);
+      },
+    };
+
+    return guarded;
+  });
+}
+
 interface CachedAgent {
   agent: Agent;
   sessionId: string;
@@ -184,6 +296,7 @@ interface CachedAgent {
   actionPayloadKey: string;
   skillResolutionKey: string;
   turnSkills: Map<string, ActivatedSkillGuidance>;
+  subAgentLoopGuard: SubAgentLoopGuardState;
   playWorldExists: boolean;
   language: string;
   modelIdentity: string;
@@ -786,11 +899,13 @@ type CreateAgentToolsForModeParams = {
   readonly activeSkills?: () => ReadonlyArray<ActivatedSkillGuidance>;
   readonly workerSkills?: (agent: string) => ReadonlyArray<ActivatedSkillGuidance>;
   readonly productionSkills?: (capability: ProductionSkillCapability) => ReadonlyArray<ActivatedSkillGuidance>;
+  readonly subAgentLoopGuard: SubAgentLoopGuardState;
 };
 
 function createAgentToolsForMode(params: CreateAgentToolsForModeParams) {
   const tools = createModeTools(params);
-  return params.intentSkillTool ? [...tools, params.intentSkillTool] : tools;
+  const allTools = params.intentSkillTool ? [...tools, params.intentSkillTool] : tools;
+  return applySubAgentLoopGuard(allTools, params.subAgentLoopGuard);
 }
 
 function createModeTools(params: CreateAgentToolsForModeParams) {
@@ -1143,6 +1258,7 @@ async function runAgentSessionUnlocked(
     const productionSkills = (capability: ProductionSkillCapability) => (
       resolveProductionSkillActivations(skillResolution.availableSkills, capability)
     );
+    const subAgentLoopGuard = createSubAgentLoopGuardState();
     const allowIntentSkillSelection = actionSource === "free-text"
       && skillResolution.forcedSkillIds.length === 0;
     const baseSystemPrompt = buildAgentSystemPrompt(bookId, language, sessionKind, {
@@ -1182,6 +1298,7 @@ async function runAgentSessionUnlocked(
         return [];
       },
       productionSkills,
+      subAgentLoopGuard,
     });
     const agent = new Agent({
       initialState: {
@@ -1226,6 +1343,7 @@ async function runAgentSessionUnlocked(
       actionPayloadKey,
       skillResolutionKey,
       turnSkills,
+      subAgentLoopGuard,
       playWorldExists,
       language,
       modelIdentity: requestedModelIdentity,
@@ -1244,6 +1362,7 @@ async function runAgentSessionUnlocked(
   }
 
   cached.lastActive = Date.now();
+  resetSubAgentLoopGuard(cached.subAgentLoopGuard);
   cached.currentAttachmentPaths = (config.attachments ?? [])
     .map((attachment) => attachment.storedPath?.trim())
     .filter((path): path is string => Boolean(path));
