@@ -1,11 +1,22 @@
 import { z } from "zod";
 
+const LLMModelMetadataEntrySchema = z.object({
+  contextWindowTokens: z.number().int().positive().optional(),
+  maxOutput: z.number().int().positive().optional(),
+}).refine(
+  (value) => value.contextWindowTokens !== undefined || value.maxOutput !== undefined,
+  { message: "model metadata must define contextWindowTokens or maxOutput" },
+);
+
+const LLMModelMetadataSchema = z.record(z.string().min(1), LLMModelMetadataEntrySchema);
+
 // C1 (v2.0.0 breaking): `maxTokens` 字段已被 providers bank 接管；zod 用 strip mode 静默丢弃老配置里的 `maxTokens`。
 const LLMServiceEntrySchema = z.object({
   service: z.string().min(1),
   name: z.string().min(1).optional(),
   baseUrl: z.string().url().optional(),
   models: z.array(z.string().min(1)).optional(),
+  modelMetadata: LLMModelMetadataSchema.optional(),
   temperature: z.number().min(0).max(2).optional(),
   apiFormat: z.enum(["chat", "responses"]).optional(),
   stream: z.boolean().optional(),
@@ -28,6 +39,7 @@ export const LLMConfigSchema = z.object({
   apiKey: z.string().default(""),
   model: z.string().min(1),
   proxyUrl: z.string().url().optional(),
+  modelMetadata: LLMModelMetadataSchema.optional(),
   temperature: z.number().min(0).max(2).default(0.7),
   thinkingBudget: z.number().int().min(0).default(0),
   extra: z.record(z.unknown()).optional(),

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AssistantMessage, Model, Api } from "@mariozechner/pi-ai";
 import {
   __resetFixedTemperatureWarnings,
+  createLLMClient,
+
   chatCompletion,
   type LLMClient,
 } from "../llm/provider.js";
@@ -150,6 +152,58 @@ async function captureError(task: Promise<unknown>): Promise<Error> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("createLLMClient model metadata", () => {
+  it("uses configured model metadata for an unknown custom model", () => {
+    const client = createLLMClient({
+      provider: "custom",
+      service: "custom",
+      configSource: "studio",
+      baseUrl: "http://127.0.0.1:8100/v1",
+      apiKey: "",
+      model: "qwen3.8-agent",
+      modelMetadata: {
+        "qwen3.8-agent": {
+          contextWindowTokens: 65536,
+          maxOutput: 16384,
+        },
+      },
+      temperature: 0.7,
+      thinkingBudget: 0,
+      apiFormat: "chat",
+      stream: true,
+    });
+
+    expect(client._piModel?.contextWindow).toBe(65536);
+    expect(client._piModel?.maxTokens).toBe(16384);
+    expect(client.defaults.maxTokens).toBe(16384);
+  });
+
+  it("configured model metadata overrides provider bank metadata", () => {
+    const client = createLLMClient({
+      provider: "anthropic",
+      service: "anthropic",
+      configSource: "studio",
+      baseUrl: "https://api.anthropic.com",
+      apiKey: "test-key",
+      model: "claude-sonnet-4-6",
+      modelMetadata: {
+        "claude-sonnet-4-6": {
+          contextWindowTokens: 54321,
+          maxOutput: 12345,
+        },
+      },
+      temperature: 0.7,
+      thinkingBudget: 0,
+      apiFormat: "chat",
+      stream: true,
+    });
+
+    expect(client._piModel?.contextWindow).toBe(54321);
+    expect(client._piModel?.maxTokens).toBe(12345);
+    expect(client.defaults.maxTokens).toBe(12345);
+  });
+});
 
 describe("chatCompletion via pi-ai", () => {
   beforeEach(() => {

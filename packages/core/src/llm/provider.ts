@@ -303,9 +303,12 @@ export interface LLMClient {
 export function createLLMClient(config: LLMConfig): LLMClient {
   // C1 (v2.0.0)：config.maxTokens / maxTokensCap 已删除；defaults.maxTokens 完全从 modelCard 推导。
   const _earlyCard = lookupModel(config.service ?? "custom", config.model);
+  const configuredModelMetadata = config.modelMetadata?.[config.model];
   const defaults = {
     temperature: config.temperature ?? 0.7,
-    maxTokens: _earlyCard?.maxOutput ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
+    maxTokens: configuredModelMetadata?.maxOutput
+      ?? _earlyCard?.maxOutput
+      ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
     thinkingBudget: config.thinkingBudget ?? 0,
     extra: config.extra ?? {},
   };
@@ -351,8 +354,12 @@ export function createLLMClient(config: LLMConfig): LLMClient {
     reasoning: (config.thinkingBudget ?? 0) > 0,
     input: ["text"] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: modelCard?.contextWindowTokens ?? 128_000,
-    maxTokens: modelCard?.maxOutput ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
+    contextWindow: configuredModelMetadata?.contextWindowTokens
+      ?? modelCard?.contextWindowTokens
+      ?? 128_000,
+    maxTokens: configuredModelMetadata?.maxOutput
+      ?? modelCard?.maxOutput
+      ?? UNKNOWN_MODEL_FALLBACK_MAX_TOKENS,
     ...(extraHeaders ? { headers: extraHeaders } : {}),
     ...(compat ? { compat } : {}),
   };

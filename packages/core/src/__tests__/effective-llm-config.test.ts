@@ -28,6 +28,44 @@ describe("resolveEffectiveLLMConfig", () => {
     await writeFile(join(root, ".inkos", "secrets.json"), JSON.stringify({ services }, null, 2), "utf-8");
   }
 
+  it("carries selected service model metadata into effective LLM config", async () => {
+    await writeProject({
+      configSource: "studio",
+      service: "custom:xyy-spark",
+      services: [
+        {
+          service: "custom",
+          name: "xyy-spark",
+          baseUrl: "http://127.0.0.1:8100/v1",
+          models: ["qwen3.8-agent"],
+          modelMetadata: {
+            "qwen3.8-agent": {
+              contextWindowTokens: 65536,
+              maxOutput: 16384,
+            },
+          },
+        },
+      ],
+      defaultModel: "qwen3.8-agent",
+    });
+
+    const result = await resolveEffectiveLLMConfig({
+      consumer: "studio",
+      projectRoot: root,
+      envLayers: { global: {}, project: {}, process: {} },
+      requireApiKey: false,
+    });
+
+    expect(result.llm.service).toBe("custom");
+    expect(result.llm.model).toBe("qwen3.8-agent");
+    expect(result.llm.modelMetadata).toEqual({
+      "qwen3.8-agent": {
+        contextWindowTokens: 65536,
+        maxOutput: 16384,
+      },
+    });
+  });
+
   it("Studio consumer 使用 Studio/project 配置，并忽略旧顶层 model/baseUrl", async () => {
     await writeProject({
       configSource: "studio",

@@ -47,6 +47,7 @@ interface ServiceConfigEntry {
   readonly name?: string;
   readonly baseUrl?: string;
   readonly models?: readonly string[];
+  readonly modelMetadata?: unknown;
   readonly temperature?: number;
   readonly maxTokens?: number;
   readonly apiFormat?: "chat" | "responses";
@@ -312,6 +313,8 @@ function applyServiceEntry(llm: Record<string, unknown>, entry: ServiceConfigEnt
   llm.service = entry.service;
   llm.provider = deriveProviderFromService(entry.service);
   llm.baseUrl = entry.baseUrl ?? resolveServicePreset(entry.service)?.baseUrl ?? "";
+  if (entry.modelMetadata !== undefined) llm.modelMetadata = entry.modelMetadata;
+  else delete llm.modelMetadata;
 
   if (entry.temperature !== undefined) llm.temperature = entry.temperature;
   if (entry.apiFormat !== undefined) llm.apiFormat = entry.apiFormat;
@@ -358,6 +361,7 @@ function normalizeServiceEntries(raw: unknown): ServiceConfigEntry[] {
         ...(typeof entry.name === "string" && entry.name.length > 0 ? { name: entry.name } : {}),
         ...(typeof entry.baseUrl === "string" && entry.baseUrl.length > 0 ? { baseUrl: entry.baseUrl } : {}),
         ...(Array.isArray(entry.models) ? { models: normalizeModelIds(entry.models) } : {}),
+        ...(entry.modelMetadata !== undefined ? { modelMetadata: entry.modelMetadata } : {}),
         ...(typeof entry.temperature === "number" ? { temperature: entry.temperature } : {}),
         ...(typeof entry.maxTokens === "number" ? { maxTokens: entry.maxTokens } : {}),
         ...(entry.apiFormat === "chat" || entry.apiFormat === "responses" ? { apiFormat: entry.apiFormat } : {}),
@@ -381,6 +385,7 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
       name: decodeURIComponent(serviceId.slice("custom:".length)),
       ...(typeof value.baseUrl === "string" && value.baseUrl.length > 0 ? { baseUrl: value.baseUrl } : {}),
       ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
+      ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
       ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
@@ -394,6 +399,7 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
       ...(typeof value.name === "string" && value.name.length > 0 ? { name: value.name } : {}),
       ...(typeof value.baseUrl === "string" && value.baseUrl.length > 0 ? { baseUrl: value.baseUrl } : {}),
       ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
+      ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
       ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
       ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
       ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
@@ -404,6 +410,7 @@ function normalizeServiceEntryFromPatch(serviceId: string, value: Record<string,
   return {
     service: serviceId,
     ...(Array.isArray(value.models) ? { models: normalizeModelIds(value.models) } : {}),
+    ...(value.modelMetadata !== undefined ? { modelMetadata: value.modelMetadata } : {}),
     ...(typeof value.temperature === "number" ? { temperature: value.temperature } : {}),
     ...(typeof value.maxTokens === "number" ? { maxTokens: value.maxTokens } : {}),
     ...(value.apiFormat === "chat" || value.apiFormat === "responses" ? { apiFormat: value.apiFormat } : {}),
