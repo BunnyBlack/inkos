@@ -379,7 +379,6 @@ function localAssistantStopStream(model: Model<Api>): AssistantMessageEventStrea
 
 export function isTerminalProductionToolName(toolName: unknown): boolean {
   return toolName === "propose_action"
-    || toolName === "sub_agent"
     || toolName === "resync_chapter_state"
     || toolName === "short_fiction_run"
     || toolName === "script_create"

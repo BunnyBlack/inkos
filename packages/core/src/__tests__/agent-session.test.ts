@@ -993,7 +993,7 @@ describe("runAgentSession cache — bookId switch", () => {
     expect(JSON.stringify(subAgent.parameters)).not.toContain('"exporter"');
   });
 
-  it("treats successful production tool results as terminal for the current turn", async () => {
+  it("continues the main agent after a successful sub_agent result", async () => {
     const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
     const pipeline = {
       runWithAgentContext: vi.fn(async (_context: unknown, task: () => Promise<unknown>) => task()),
@@ -1011,8 +1011,8 @@ describe("runAgentSession cache — bookId switch", () => {
     );
 
     expect(pipeline.writeNextChapter).toHaveBeenCalledTimes(1);
-    expect(result.responseText).toBe("");
-    expect(streamCalls).toHaveLength(1);
+    expect(result.responseText).toBe("ok");
+    expect(streamCalls).toHaveLength(2);
     expect(result.messages).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ role: "toolResult", toolName: "sub_agent" }),
