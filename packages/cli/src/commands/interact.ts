@@ -94,6 +94,8 @@ export function createInteractCommand(hooks: InteractCommandHooks = {}): Command
         runtime: client.defaults,
       }, input);
 
+      if (result.errorMessage) throw new Error(result.errorMessage);
+
       const responseText = result.responseText;
       const session = {
         sessionId,

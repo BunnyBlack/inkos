@@ -79,6 +79,19 @@ describe("tui agent session bridge", () => {
     await rm(projectRoot, { recursive: true, force: true });
   });
 
+  it("surfaces agent failure and persists a failed execution instead of completion", async () => {
+    runAgentSessionMock.mockResolvedValueOnce({
+      responseText: "", messages: [], errorMessage: "Agent loop guard: read failed 3 times.",
+    });
+    const { processTuiAgentInput } = await import("../tui/agent-input.js");
+    await expect(processTuiAgentInput({
+      projectRoot, input: "Read the notes.", session: createProjectSession(projectRoot),
+    })).rejects.toThrow("Agent loop guard");
+    const persisted = await loadProjectSession(projectRoot);
+    expect(persisted.currentExecution?.status).toBe("failed");
+    expect(persisted.messages.at(-1)).toMatchObject({ role: "user", content: "Read the notes." });
+  });
+
   it("runs agent chat and persists raw assistant output into the tui session", async () => {
     runAgentSessionMock.mockResolvedValue({
       responseText: "这是 agent 直接返回的回复。",

@@ -1390,15 +1390,9 @@ describe("agent deterministic writing tools", () => {
     await writeFile(outsidePath, "outside secret", "utf-8");
     const tool = createReadTool(root);
 
-    const result = await tool.execute("tool-read-default", {
+    await expect(tool.execute("tool-read-default", {
       path: outsidePath,
-    });
-
-    expect(result.content[0]?.type).toBe("text");
-    if (result.content[0]?.type === "text") {
-      expect(result.content[0].text).toContain("Path traversal blocked");
-      expect(result.content[0].text).not.toContain("outside secret");
-    }
+    })).rejects.toThrow("Path traversal blocked");
   });
 
   it("does not silently truncate long read results", async () => {
@@ -1431,13 +1425,9 @@ describe("agent deterministic writing tools", () => {
       text: "# Storm Eye\n\nAuthoritative source.",
     });
 
-    const escaped = await tool.execute("tool-read-project-escape", {
+    await expect(tool.execute("tool-read-project-escape", {
       path: "../outside.md",
-    });
-    expect(escaped.content[0]?.type).toBe("text");
-    if (escaped.content[0]?.type === "text") {
-      expect(escaped.content[0].text).toContain("Path traversal blocked");
-    }
+    })).rejects.toThrow("Path traversal blocked");
   });
 
   it("reads absolute system paths when explicitly enabled", async () => {

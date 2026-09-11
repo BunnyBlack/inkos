@@ -60,6 +60,8 @@ export const agentCommand = new Command("agent")
         fullInstruction,
       );
 
+      if (result.errorMessage) throw new Error(result.errorMessage);
+
       if (opts.json) {
         log(JSON.stringify({ result }));
       } else if (!opts.quiet && result.responseText.trim()) {

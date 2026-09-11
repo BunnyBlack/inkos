@@ -731,13 +731,8 @@ describe("runAgentSession cache — bookId switch", () => {
     );
 
     const readTool = agentInstances[0].state.tools.find((tool: any) => tool.name === "read");
-    const result = await readTool.execute("tool-read-default-session", { path: outsidePath });
-
-    expect(result.content[0]?.type).toBe("text");
-    if (result.content[0]?.type === "text") {
-      expect(result.content[0].text).toContain("Path traversal blocked");
-      expect(result.content[0].text).not.toContain("outside content");
-    }
+    await expect(readTool.execute("tool-read-default-session", { path: outsidePath }))
+      .rejects.toThrow("Path traversal blocked");
   });
 
   it("can explicitly enable system file read for the session read tool", async () => {
@@ -788,13 +783,8 @@ describe("runAgentSession cache — bookId switch", () => {
     );
 
     const readTool = agentInstances[0].state.tools.find((tool: any) => tool.name === "read");
-    const result = await readTool.execute("tool-read-disabled-session", { path: outsidePath });
-
-    expect(result.content[0]?.type).toBe("text");
-    if (result.content[0]?.type === "text") {
-      expect(result.content[0].text).toContain("Path traversal blocked");
-      expect(result.content[0].text).not.toContain("outside content");
-    }
+    await expect(readTool.execute("tool-read-disabled-session", { path: outsidePath }))
+      .rejects.toThrow("Path traversal blocked");
   });
 
   it("exposes only confirmation proposals and research in general chat", async () => {

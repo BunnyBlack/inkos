@@ -122,6 +122,18 @@ export async function processTuiAgentInput(params: {
   );
   const createdBookId = extractCreatedBookId(result.messages);
   const activeBookId = createdBookId ?? resolvedBookId;
+  if (result.errorMessage) {
+    await persistProjectSession(params.projectRoot, {
+      ...nextSession,
+      ...(activeBookId ? { activeBookId } : {}),
+      currentExecution: {
+        ...nextSession.currentExecution,
+        status: "failed",
+        ...(activeBookId ? { bookId: activeBookId } : {}),
+      },
+    });
+    throw new Error(result.errorMessage);
+  }
   const proposedAction = extractProposedAction(result.messages);
   const responseText = proposedAction
     ? formatProposedAction(proposedAction, language)

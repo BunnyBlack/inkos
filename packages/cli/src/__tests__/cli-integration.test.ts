@@ -207,6 +207,12 @@ describe("CLI integration", () => {
   });
 
   describe("inkos interact", () => {
+    it("exits nonzero when the real agent transport fails", () => {
+      const result = runStderr(["interact", "--message", "Read the notes."], { env: failingLlmEnv });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("Connection error");
+    }, CLI_PROCESS_TIMEOUT_MS);
+
     it("returns the agent-session JSON contract for natural-language interactions", async () => {
       const initialized = await stat(join(projectDir, "inkos.json")).then(() => true).catch(() => false);
       if (!initialized) run(["init"]);
@@ -218,11 +224,13 @@ describe("CLI integration", () => {
           Object.entries(failingLlmEnv).map(([key, value]) => `${key}=${value}`).join("\n"),
           "utf-8",
         );
-        const output = run(["interact", "--json", "--message", "切换到全自动"]);
+        const output = run(["interact", "--json", "--message", "切换到全自动"], {
+          env: { INKOS_AGENT_LLM_STUB: "1" },
+        });
         const data = JSON.parse(output);
 
         expect(data.request).toBeUndefined();
-        expect(data.responseText).toEqual(expect.any(String));
+        expect(data.responseText.trim().length).toBeGreaterThan(0);
         expect(data.session).toEqual(expect.objectContaining({
           sessionKind: "chat",
         }));
@@ -255,7 +263,9 @@ describe("CLI integration", () => {
           updatedAt: "2026-04-07T00:00:00.000Z",
         });
 
-        const output = run(["interact", "--json", "--book", "harbor", "--message", "/books"]);
+        const output = run(["interact", "--json", "--book", "harbor", "--message", "/books"], {
+          env: { INKOS_AGENT_LLM_STUB: "1" },
+        });
         const data = JSON.parse(output);
 
         expect(data.session.activeBookId).toBe("harbor");

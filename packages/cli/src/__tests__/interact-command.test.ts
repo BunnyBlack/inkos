@@ -69,6 +69,16 @@ describe("interact command", () => {
     vi.restoreAllMocks();
   });
 
+  it("propagates agent failure instead of silently emitting an empty success", async () => {
+    runAgentSessionMock.mockResolvedValueOnce({
+      responseText: "", messages: [], errorMessage: "Agent loop guard: ls failed 3 times.",
+    } as any);
+    const command = createInteractCommand();
+    await expect(command.parseAsync(["List the directory."], { from: "user" }))
+      .rejects.toThrow("Agent loop guard");
+    expect(stdoutOutput).toEqual([]);
+  });
+
   it("routes natural language through runAgentSession", async () => {
     const command = createInteractCommand({ readInput: async () => "" });
 

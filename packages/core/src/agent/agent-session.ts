@@ -87,6 +87,7 @@ import {
 } from "./skill-tool.js";
 import { opaqueConversationId, runWithAgentTrajectory } from "../llm/agent-trajectory.js";
 import { guardedPiStream } from "./pi-stream.js";
+import { SessionLoopGuard } from "./session-loop-guard.js";
 import type { LLMRuntimePolicy } from "../llm/runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -300,6 +301,7 @@ interface CachedAgent {
   skillResolutionKey: string;
   turnSkills: Map<string, ActivatedSkillGuidance>;
   subAgentLoopGuard: SubAgentLoopGuardState;
+  loopGuard: SessionLoopGuard;
   playWorldExists: boolean;
   language: string;
   modelIdentity: string;
@@ -1257,6 +1259,7 @@ async function runAgentSessionUnlocked(
       resolveProductionSkillActivations(skillResolution.availableSkills, capability)
     );
     const subAgentLoopGuard = createSubAgentLoopGuardState();
+    const loopGuard = new SessionLoopGuard();
     const allowIntentSkillSelection = actionSource === "free-text"
       && skillResolution.forcedSkillIds.length === 0;
     const baseSystemPrompt = buildAgentSystemPrompt(bookId, language, sessionKind, {
@@ -1321,6 +1324,7 @@ async function runAgentSessionUnlocked(
           terminalToolResultTail = false;
           return localAssistantStopStream(streamModel);
         }
+        loopGuard.beforeModelCall();
         if (isLlmStubEnabled()) return stubAgentStream(streamModel, context);
         return guardedPiStream(streamModel, context, options, config.runtime);
       },
@@ -1342,6 +1346,7 @@ async function runAgentSessionUnlocked(
       skillResolutionKey,
       turnSkills,
       subAgentLoopGuard,
+      loopGuard,
       playWorldExists,
       language,
       modelIdentity: requestedModelIdentity,
@@ -1361,6 +1366,7 @@ async function runAgentSessionUnlocked(
 
   cached.lastActive = Date.now();
   resetSubAgentLoopGuard(cached.subAgentLoopGuard);
+  cached.loopGuard.reset();
   cached.currentAttachmentPaths = (config.attachments ?? [])
     .map((attachment) => attachment.storedPath?.trim())
     .filter((path): path is string => Boolean(path));
@@ -1431,6 +1437,7 @@ async function runAgentSessionUnlocked(
 
   // ----- Subscribe to events (transcript persistence + SSE forwarding) -----
   const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
+    cached.loopGuard.observe(event);
     await persistAgentEvent(event);
     onEvent?.(event);
   });
@@ -1461,6 +1468,11 @@ async function runAgentSessionUnlocked(
       )
     ));
     errorMessage = assistantErrorMessage(finalAssistant);
+    if (!errorMessage && finalAssistant
+      && !extractTextFromAssistant(finalAssistant).trim()
+      && !hasUnansweredTerminalToolResult(agent.state.messages)) {
+      errorMessage = "Agent returned no visible response. This turn was not committed; inspect the model output before retrying.";
+    }
     if (errorMessage) {
       const failedError = errorMessage;
       await appendAgentTranscriptEvent(projectRoot, sessionId, (seq) => ({

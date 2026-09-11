@@ -6,7 +6,7 @@ import { type ReviseMode } from "../agents/reviser.js";
 import { defaultChapterLength } from "../utils/length-metrics.js";
 import { inferLanguage } from "../utils/language.js";
 import { mkdir, readFile, writeFile, readdir, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StateManager } from "../state/manager.js";
 import { deleteLatestChapter } from "../state/chapter-delete.js";
 import { assertSafeTruthFileName, createInteractionToolsFromDeps } from "../interaction/project-tools.js";
@@ -3567,7 +3567,7 @@ export function createReadTool(
     ? "Read a file. Relative paths resolve under books/; absolute paths read from the system filesystem."
     : options.scope === "project"
       ? "Read a UTF-8 file inside the current InkOS project. Path is relative to the project root."
-    : "Read a file from the book directory. Path is relative to books/.";
+    : "Read a UTF-8 file under books/. Include the book ID, e.g. book-id/chapters/notes.md. Copy a file path returned by ls; paths are not relative to the active book.";
 
   return {
     name: "read",
@@ -3583,7 +3583,7 @@ export function createReadTool(
         const content = await readFile(filePath, "utf-8");
         return textResult(content);
       } catch (err: any) {
-        return textResult(`Failed to read "${params.path}": ${err?.message ?? String(err)}`);
+        throw new Error(`Failed to read "${params.path}": ${err?.message ?? String(err)}`);
       }
     },
   };
@@ -3763,7 +3763,7 @@ export function createLsTool(projectRoot: string): AgentTool<typeof LsParams> {
 
   return {
     name: "ls",
-    description: "List files in a book directory. Optionally specify a subdirectory like 'story' or 'chapters'.",
+    description: "List files in a book directory. bookId is required; subdir is relative to that book. Returned paths are relative to books/ and can be passed directly to read. Each line is a separate entry; directory entries end in /.",
     label: "List Files",
     parameters: LsParams,
     async execute(
@@ -3779,12 +3779,13 @@ export function createLsTool(projectRoot: string): AgentTool<typeof LsParams> {
 
         for (const entry of entries) {
           const fullPath = join(target, entry);
+          const readPath = relative(booksRoot, fullPath).replace(/\\/g, "/");
           try {
             const entryStat = await stat(fullPath);
             const suffix = entryStat.isDirectory() ? "/" : ` (${entryStat.size} bytes)`;
-            details.push(`${entry}${suffix}`);
+            details.push(`${readPath}${suffix}`);
           } catch {
-            details.push(entry);
+            details.push(readPath);
           }
         }
 
@@ -3792,9 +3793,9 @@ export function createLsTool(projectRoot: string): AgentTool<typeof LsParams> {
           return textResult(`Directory is empty: ${params.bookId}/${params.subdir ?? ""}`);
         }
 
-        return textResult(details.join("\n"));
+        return textResult(`Paths relative to books/ (file paths can be passed to read):\n${details.join("\n")}`);
       } catch (err: any) {
-        return textResult(`Failed to list "${params.bookId}/${params.subdir ?? ""}": ${err?.message ?? String(err)}`);
+        throw new Error(`Failed to list "${params.bookId}/${params.subdir ?? ""}": ${err?.message ?? String(err)}`);
       }
     },
   };
