@@ -1,12 +1,13 @@
 import { access, mkdir, readdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ChapterMeta } from "../models/chapter.js";
+import { isChapterStateDegraded } from "../pipeline/chapter-state-recovery.js";
 import { toPosixPath } from "../utils/posix-path.js";
 
 export interface ChapterDeleteDeps {
   bookDir(bookId: string): string;
   loadChapterIndex(bookId: string): Promise<ReadonlyArray<ChapterMeta>>;
-  rollbackToChapter(bookId: string, targetChapter: number): Promise<ReadonlyArray<number>>;
+  rollbackToChapter(bookId: string, targetChapter: number, options?: { readonly keepChaptersThrough?: number }): Promise<ReadonlyArray<number>>;
 }
 
 export interface DeleteLatestChapterOptions {
@@ -22,6 +23,8 @@ export interface DeleteLatestChapterResult {
   readonly trashedFiles: ReadonlyArray<string>;
   readonly rolledBackTo: number;
   readonly discarded: ReadonlyArray<number>;
+  /** Retained chapters whose state must be rebuilt in chapter order. */
+  readonly pendingStateRepair: ReadonlyArray<number>;
 }
 
 /**
@@ -53,22 +56,27 @@ export async function deleteLatestChapter(
   }
 
   const bookDir = deps.bookDir(bookId);
-  const rollbackTarget = latest - 1;
+  let rollbackTarget = latest - 1;
 
   // Verify the rollback snapshot is usable BEFORE touching any file, so a
   // failed restore cannot leave the book half-deleted.
-  for (const required of ["current_state.md", "pending_hooks.md"]) {
-    const snapshotFile = join(bookDir, "story", "snapshots", String(rollbackTarget), required);
-    try {
-      await stat(snapshotFile);
-    } catch {
-      throw new Error(
-        `Cannot delete chapter ${latest}: the state snapshot for chapter ${rollbackTarget} is missing `
-        + `(story/snapshots/${rollbackTarget}/${required}). Nothing was changed.`,
-      );
-    }
+  for (; rollbackTarget >= 0; rollbackTarget -= 1) {
+    if (index.some((chapter) => chapter.number <= rollbackTarget && isChapterStateDegraded(chapter))) continue;
+    const usable = await Promise.all(["current_state.md", "pending_hooks.md"].map(async (required) => {
+      try {
+        return (await stat(join(bookDir, "story", "snapshots", String(rollbackTarget), required))).isFile();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    }));
+    if (usable.every(Boolean)) break;
   }
-
+  if (rollbackTarget < 0) {
+    throw new Error(
+      `Cannot delete chapter ${latest}: no usable state snapshot exists before it. Nothing was changed.`,
+    );
+  }
   // Preserve the chapter markdown in chapters/.trash/ instead of hard-deleting.
   const chaptersDir = join(bookDir, "chapters");
   const trashDir = join(chaptersDir, ".trash");
@@ -87,7 +95,9 @@ export async function deleteLatestChapter(
     trashedFiles.push(toPosixPath(join("chapters", ".trash", trashedName)));
   }
 
-  const discarded = await deps.rollbackToChapter(bookId, rollbackTarget);
+  const discarded = rollbackTarget === latest - 1
+    ? await deps.rollbackToChapter(bookId, rollbackTarget)
+    : await deps.rollbackToChapter(bookId, rollbackTarget, { keepChaptersThrough: latest - 1 });
   const entry = index.find((chapter) => chapter.number === latest);
 
   return {
@@ -97,6 +107,8 @@ export async function deleteLatestChapter(
     trashedFiles,
     rolledBackTo: rollbackTarget,
     discarded,
+    pendingStateRepair: index.filter((chapter) => chapter.number > rollbackTarget && chapter.number < latest)
+      .map((chapter) => chapter.number).sort((left, right) => left - right),
   };
 }
 

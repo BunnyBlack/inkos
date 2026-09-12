@@ -152,6 +152,24 @@ describe("inkos chapter delete", () => {
       .resolves.toBe("第二章。");
   });
 
+  it("reports retained chapters needing repair when deletion falls back to snapshot zero", async () => {
+    const bookDir = await setupBook({
+      bookId: "brokenchain",
+      chapters: [{ file: "0001_One.md", content: "Body one" }, { file: "0002_Two.md", content: "Body two" }],
+      index: [chapterEntry(1, "One", 8), chapterEntry(2, "Two", 8)],
+      snapshotChapters: [0],
+    });
+    const { chapterCommand } = await import("../commands/chapter.js");
+    await chapterCommand.parseAsync(["node", "chapter", "delete", "brokenchain", "--force", "--json"], { from: "node" });
+    expect(logErrorMock).not.toHaveBeenCalled();
+    const output = JSON.parse(logMock.mock.calls.at(-1)?.[0] as string);
+    expect(output.pendingStateRepair).toEqual([1]);
+    expect(output.rolledBackTo).toBe(0);
+    await expect(readFile(join(bookDir, "chapters", "0001_One.md"), "utf-8")).resolves.toBe("Body one");
+    const index = JSON.parse(await readFile(join(bookDir, "chapters", "index.json"), "utf-8"));
+    expect(index[0].status).toBe("state-degraded");
+  });
+
   it("fails with exit code 1 when asked to delete a non-latest chapter", async () => {
     await setupBook({
       bookId: "midbook",

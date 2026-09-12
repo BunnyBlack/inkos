@@ -144,6 +144,36 @@ describe("deleteLatestChapter", () => {
     await expect(exists(join(bookDir, "chapters", ".trash"))).resolves.toBe(false);
   });
 
+  it("restores the nearest trustworthy snapshot while preserving earlier bodies for repair", async () => {
+    const { root, bookDir } = await setupBook({
+      bookId: "brokenchain",
+      chapters: [
+        { number: 1, title: "One", content: "Body one" },
+        { number: 2, title: "Two", content: "Body two" },
+      ],
+      snapshotChapters: [0, 2],
+    });
+    const state = new StateManager(root);
+    await mkdir(join(bookDir, "story", "runtime"), { recursive: true });
+    await mkdir(join(bookDir, "story", "drafts"), { recursive: true });
+    await writeFile(join(bookDir, "story", "runtime", "chapter-0001.user-brief.md"), "User direction", "utf-8");
+    await writeFile(join(bookDir, "story", "drafts", "0001_One.md"), "User draft", "utf-8");
+    const result = await deleteLatestChapter(state, "brokenchain");
+    expect(result.deletedChapter).toBe(2);
+    expect(result.rolledBackTo).toBe(0);
+    expect(result.discarded).toEqual([2]);
+    const index = await state.loadChapterIndex("brokenchain");
+    expect(index.map((chapter) => chapter.number)).toEqual([1]);
+    expect(index[0]?.status).toBe("state-degraded");
+    await expect(readFile(join(bookDir, "chapters", "0001_One.md"), "utf-8")).resolves.toBe("Body one");
+    await expect(readFile(join(bookDir, "chapters", ".trash", "0002_Two.md"), "utf-8")).resolves.toBe("Body two");
+    await expect(readFile(join(bookDir, "story", "current_state.md"), "utf-8")).resolves.toBe("state at chapter 0");
+    expect(await exists(join(bookDir, "story", "snapshots", "1"))).toBe(false);
+    expect(await exists(join(bookDir, "story", "snapshots", "2"))).toBe(false);
+    await expect(readFile(join(bookDir, "story", "runtime", "chapter-0001.user-brief.md"), "utf-8")).resolves.toBe("User direction");
+    await expect(readFile(join(bookDir, "story", "drafts", "0001_One.md"), "utf-8")).resolves.toBe("User draft");
+  });
+
   it("deletes the only chapter of a book when the chapter-0 snapshot exists", async () => {
     const { root, bookDir } = await setupBook({
       bookId: "onebook",

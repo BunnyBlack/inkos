@@ -177,6 +177,8 @@ export function buildSettlerUserPrompt(params: {
   readonly selectedEvidenceBlock?: string;
   readonly governedControlBlock?: string;
   readonly validationFeedback?: string;
+  readonly settlementGuidance?: string;
+  readonly language?: "zh" | "en";
 }): string {
   const ledgerBlock = params.ledger
     ? `\n## 当前资源账本\n${params.ledger}\n`
@@ -211,10 +213,17 @@ export function buildSettlerUserPrompt(params: {
   const validationFeedbackBlock = params.validationFeedback
     ? `\n## 状态校验反馈\n${params.validationFeedback}\n\n请严格纠正这些矛盾，只修正 truth files，不要改写正文，不要引入正文中不存在的新事实。\n`
     : "";
+  const guidance = params.settlementGuidance?.trim();
+  const guidanceBlock = guidance
+    ? params.language === "en"
+      ? `\n## Settlement interpretation guidance\n${guidance}\n\nInterpret the persisted chapter text using this guidance. The text remains authoritative; do not rewrite it or introduce unsupported facts.\n`
+      : `\n## 状态结算解读指导\n${guidance}\n\n请用以上指导解读已保存正文，事实仍以正文为准；不要改写正文或引入正文未支持的事实。\n`
+    : "";
 
   return `请分析第${params.chapterNumber}章「${params.title}」的正文，更新所有追踪文件。
 ${observationsBlock}
 ${validationFeedbackBlock}
+${guidanceBlock}
 ## 本章正文
 
 ${params.content}

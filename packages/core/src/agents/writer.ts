@@ -87,6 +87,7 @@ export interface SettleChapterStateInput {
   readonly contextPackage?: ContextPackage;
   readonly ruleStack?: RuleStack;
   readonly validationFeedback?: string;
+  readonly settlementGuidance?: string;
 }
 
 export interface TokenUsage {
@@ -447,6 +448,7 @@ export class WriterAgent extends BaseAgent {
       contextPackage: input.contextPackage,
       ruleStack: input.ruleStack,
       validationFeedback: input.validationFeedback,
+      settlementGuidance: input.settlementGuidance,
       originalHooks: hooks,
       originalSubplots: subplotBoard,
       originalEmotionalArcs: emotionalArcs,
@@ -511,6 +513,7 @@ export class WriterAgent extends BaseAgent {
     readonly contextPackage?: ContextPackage;
     readonly ruleStack?: RuleStack;
     readonly validationFeedback?: string;
+    readonly settlementGuidance?: string;
     readonly originalHooks: string;
     readonly originalSubplots: string;
     readonly originalEmotionalArcs: string;
@@ -573,6 +576,8 @@ export class WriterAgent extends BaseAgent {
       selectedEvidenceBlock: params.selectedEvidenceBlock,
       governedControlBlock,
       validationFeedback: params.validationFeedback,
+      settlementGuidance: params.settlementGuidance,
+      language: resolvedLang,
     });
 
     const response = await this.chat(

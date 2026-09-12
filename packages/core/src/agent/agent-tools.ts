@@ -3394,7 +3394,7 @@ export function createDeleteLatestChapterTool(
     name: "delete_latest_chapter",
     description:
       "Safely delete only the latest chapter, preserve its manuscript under chapters/.trash, " +
-      "and roll story state back to the previous chapter snapshot. Never deletes a middle chapter.",
+      "and restore the nearest trustworthy snapshot. Earlier bodies are retained and marked for state repair if their snapshots are missing. Never deletes a middle chapter.",
     label: "Delete Latest Chapter",
     parameters: DeleteLatestChapterParams,
     async execute(_toolCallId, params): Promise<AgentToolResult<unknown>> {
@@ -3406,7 +3406,8 @@ export function createDeleteLatestChapterTool(
           chapterNumber: params.chapterNumber,
         });
         return textResult(
-          `Deleted latest chapter ${result.deletedChapter} from "${bookId}", preserved it in trash, and rolled story state back to chapter ${result.rolledBackTo}.`,
+          `Deleted latest chapter ${result.deletedChapter} from "${bookId}", preserved it in trash, and rolled story state back to chapter ${result.rolledBackTo}.`
+            + (result.pendingStateRepair.length ? ` Retained chapters ${result.pendingStateRepair.join(", ")} need write sync or write repair-state in chapter order.` : ""),
           {
             kind: "chapter_deleted",
             ...result,
@@ -3498,7 +3499,7 @@ export function createResyncChapterStateTool(
     name: "resync_chapter_state",
     description:
       "Keep the persisted chapter body unchanged, rebuild its derived story state, summaries, and hooks from the previous chapter snapshot, then run a fresh audit. " +
-      "Use after an explicit chapter edit or when the user asks to repair/synchronize truth state without rewriting prose. Only the latest chapter is supported.",
+      "Use after an explicit chapter edit or when the user asks to repair/synchronize truth state without rewriting prose. Repair earlier degraded chapters first. Syncing a middle chapter preserves later bodies but invalidates their state; rebuild them in chapter order.",
     label: "Resync Chapter State",
     parameters: ResyncChapterStateParams,
     async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {

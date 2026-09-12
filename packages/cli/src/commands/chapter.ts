@@ -92,9 +92,16 @@ chapterCommand
         }
       }
 
-      const result = await deleteLatestChapter(state, bookId, {
-        ...(requestedChapter === undefined ? {} : { chapterNumber: requestedChapter }),
-      });
+      const releaseLock = await state.acquireBookLock(bookId);
+      const result = await (async () => {
+        try {
+          return await deleteLatestChapter(state, bookId, {
+            ...(requestedChapter === undefined ? {} : { chapterNumber: requestedChapter }),
+          });
+        } finally {
+          await releaseLock();
+        }
+      })();
 
       if (opts.json) {
         log(JSON.stringify(result, null, 2));
@@ -104,6 +111,7 @@ chapterCommand
           title: result.title,
           trashedFiles: result.trashedFiles,
           rolledBackTo: result.rolledBackTo,
+          pendingStateRepair: result.pendingStateRepair,
         }));
       }
     } catch (e) {

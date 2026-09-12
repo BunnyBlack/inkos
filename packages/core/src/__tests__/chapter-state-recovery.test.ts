@@ -10,6 +10,7 @@ import type { ChapterMeta } from "../models/chapter.js";
 import {
   buildStateDegradedPersistenceOutput,
   buildStateDegradedReviewNote,
+  markChapterStateDegraded,
   parseStateDegradedReviewNote,
   resolveStateDegradedBaseStatus,
   retrySettlementAfterValidationFailure,
@@ -113,6 +114,8 @@ describe("chapter-state-recovery", () => {
       book: createBook(),
       bookDir: "/tmp/test-book",
       chapterNumber: 3,
+      baselineChapter: 2,
+      settlementGuidance: "  Keep the token in the coat  ",
       title: "第三章",
       content: "铜牌贴在胸口。",
       oldState: "old state",
@@ -128,6 +131,8 @@ describe("chapter-state-recovery", () => {
     expect(capturedFeedback).toContain("铜牌位置与正文矛盾");
     expect(writer.settleChapterState).toHaveBeenCalledWith(expect.objectContaining({
       allowReapply: true,
+      baselineChapter: 2,
+      settlementGuidance: "  Keep the token in the coat  ",
     }));
     expect(logWarn).toHaveBeenCalledWith(expect.objectContaining({
       zh: expect.stringContaining("仅重试结算层"),
@@ -231,5 +236,71 @@ describe("chapter-state-recovery", () => {
       reviewNote: "{bad json",
       auditIssues: ["[warning] needs review"],
     }))).toBe("ready-for-review");
+  });
+
+  it.each([
+    { name: "legacy failed audit with stale successful metadata", status: "audit-failed", baseStatus: "ready-for-review", auditIssues: ["[critical] body contradiction"], expected: "audit-failed" },
+    { name: "explicit audit failure without critical issues", status: "audit-failed", baseStatus: "ready-for-review", auditIssues: [], expected: "audit-failed" },
+    { name: "real critical issue overrides ready status", status: "ready-for-review", baseStatus: "ready-for-review", auditIssues: ["[critical] body contradiction"], expected: "audit-failed" },
+    { name: "new successful audit overrides stale failed metadata", status: "ready-for-review", baseStatus: "audit-failed", auditIssues: [], expected: "ready-for-review" },
+    { name: "degraded failed audit metadata", status: "state-degraded", baseStatus: "audit-failed", auditIssues: [], expected: "audit-failed" },
+    { name: "approved status does not override failed metadata", status: "approved", baseStatus: "audit-failed", auditIssues: [], expected: "audit-failed" },
+    { name: "injected critical settlement issue is not a body failure", status: "state-degraded", baseStatus: "ready-for-review", auditIssues: ["[critical] settlement contradiction"], expected: "ready-for-review" },
+    { name: "missing metadata defaults to successful body audit", status: "state-degraded", baseStatus: undefined, auditIssues: [], expected: "ready-for-review" },
+  ] as const)("resolves $name", ({ status, baseStatus, auditIssues, expected }) => {
+    const reviewNote = baseStatus && JSON.stringify({
+      kind: "state-degraded",
+      baseStatus,
+      injectedIssues: ["[critical] settlement contradiction"],
+    });
+    expect(resolveStateDegradedBaseStatus(createChapterMeta({
+      status,
+      reviewNote,
+      auditIssues: [...auditIssues],
+    }))).toBe(expected);
+  });
+
+  it.each([
+    { status: "audit-failed", baseStatus: "ready-for-review", expected: "audit-failed" },
+    { status: "ready-for-review", baseStatus: "audit-failed", expected: "ready-for-review" },
+  ] as const)("normalizes legacy $status metadata and preserves it on retries", ({ status, baseStatus, expected }) => {
+    const chapter = createChapterMeta({
+      status,
+      reviewNote: JSON.stringify({ kind: "state-degraded", baseStatus, injectedIssues: ["[critical] settlement contradiction"] }),
+      auditIssues: ["[critical] settlement contradiction"],
+    });
+    const invalidated = markChapterStateDegraded(chapter);
+    expect(invalidated.status).toBe("state-degraded");
+    expect(parseStateDegradedReviewNote(invalidated.reviewNote)).toEqual({
+      kind: "state-degraded",
+      baseStatus: expected,
+      injectedIssues: ["[critical] settlement contradiction"],
+    });
+    expect(invalidated.auditIssues).toEqual(chapter.auditIssues);
+    const retried = markChapterStateDegraded(invalidated);
+    expect(resolveStateDegradedBaseStatus(retried)).toBe(expected);
+    expect(retried.reviewNote).toBe(invalidated.reviewNote);
+  });
+
+  it("normalizes already degraded metadata when a real critical body issue survives", () => {
+    const chapter = createChapterMeta({
+      reviewNote: buildStateDegradedReviewNote("ready-for-review", []),
+      auditIssues: ["[critical] body contradiction"],
+    });
+    expect(parseStateDegradedReviewNote(markChapterStateDegraded(chapter).reviewNote)?.baseStatus).toBe("audit-failed");
+  });
+
+  it("replaces malformed degradation metadata with a valid resolved note", () => {
+    const chapter = createChapterMeta({ reviewNote: "{bad json" });
+    expect(parseStateDegradedReviewNote(markChapterStateDegraded(chapter).reviewNote)).toEqual({
+      kind: "state-degraded",
+      baseStatus: "ready-for-review",
+      injectedIssues: [],
+    });
+  });
+
+  it("requires a new body audit for newly invalidated healthy chapters", () => {
+    const chapter = createChapterMeta({ status: "ready-for-review" });
+    expect(parseStateDegradedReviewNote(markChapterStateDegraded(chapter).reviewNote)?.baseStatus).toBe("audit-failed");
   });
 });

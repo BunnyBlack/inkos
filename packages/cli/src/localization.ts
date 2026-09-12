@@ -499,11 +499,18 @@ export function formatChapterDeleteCancelled(language: CliLanguage): string {
 
 export function formatChapterDeleteDone(
   language: CliLanguage,
-  params: { number: number; title: string; trashedFiles: ReadonlyArray<string>; rolledBackTo: number },
+  params: { number: number; title: string; trashedFiles: ReadonlyArray<string>; rolledBackTo: number; pendingStateRepair?: ReadonlyArray<number> },
 ): string {
   const trashNote = params.trashedFiles.length > 0
     ? params.trashedFiles.join(", ")
     : localize(language, { zh: "（章节文件已不存在，未移动）", en: "(chapter file was already gone; nothing moved)" });
+  if (params.pendingStateRepair?.length) {
+    const chapters = params.pendingStateRepair.join(", ");
+    return localize(language, {
+      zh: `已删除第${params.number}章 ${params.title}：章节文件保留在 ${trashNote}。故事状态恢复到第${params.rolledBackTo}章；第 ${chapters} 章正文与索引保留，已标记为状态降级。请按章号顺序运行 write sync 或 write repair-state。`,
+      en: `Deleted chapter ${params.number} ${params.title}: chapter file kept at ${trashNote}. Story state restored to chapter ${params.rolledBackTo}; chapters ${chapters} retain their bodies and index entries but require state repair. Run write sync or write repair-state in chapter order.`,
+    });
+  }
   return localize(language, {
     zh: `已删除第${params.number}章 ${params.title}：章节文件保留在 ${trashNote}，索引和故事状态已回滚到第${params.rolledBackTo}章。`,
     en: `Deleted chapter ${params.number} ${params.title}: chapter file kept at ${trashNote}; index and story state rolled back to chapter ${params.rolledBackTo}.`,

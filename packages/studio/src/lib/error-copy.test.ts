@@ -4,6 +4,9 @@ import { localizeKnownRuntimeMessage } from "./error-copy";
 describe("localizeKnownRuntimeMessage", () => {
   it("localizes the state-degraded continuation blocker", () => {
     expect(localizeKnownRuntimeMessage(
+      "Chapter 1 is state-degraded. Run write repair-state or write sync for chapter 1 before continuing.",
+    )).toBe("第 1 章处于状态降级（state-degraded）。请先按章号顺序修复状态或同步正文，再继续。");
+    expect(localizeKnownRuntimeMessage(
       "Latest chapter 1 is state-degraded. Repair state or rewrite that chapter before continuing.",
     )).toBe("最新第 1 章处于状态降级（state-degraded）。继续写下一章前，请先修复状态，或重写这一章。");
   });

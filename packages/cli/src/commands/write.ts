@@ -271,7 +271,7 @@ writeCommand
 
 writeCommand
   .command("sync")
-  .description("Rebuild truth files and SQLite indexes from the latest edited chapter body")
+  .description("Rebuild chapter truth/state from its body; later chapters keep their text but require state repair in order")
   .argument("<args...>", "Book ID (optional) and chapter number")
   .option("--brief <text>", "One-off guidance for how to interpret the edited chapter while syncing")
   .option("--json", "Output JSON")

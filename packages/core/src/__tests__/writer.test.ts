@@ -610,9 +610,12 @@ describe("WriterAgent", () => {
         chapterNumber: 3,
         title: "River Ledger",
         content: "Lin Yue follows the debt into the river-port ledger.",
+        settlementGuidance: "Keep the token in the coat",
       });
 
       expect(output.runtimeStateDelta).toBeUndefined();
+      const reflector = vi.mocked(WriterAgent.prototype as any).chat.mock.calls[1][0][1].content;
+      expect(reflector).toContain("Keep the token in the coat");
       expect(output.postSettlement).toContain("legacy settlement survived");
       expect(output.updatedState).toContain("Keep tracing the debt");
       expect(output.updatedHooks).toContain("mentor-debt");

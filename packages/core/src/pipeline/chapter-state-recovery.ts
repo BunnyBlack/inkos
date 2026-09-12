@@ -19,6 +19,7 @@ export interface SettlementRetryParams {
   readonly bookDir: string;
   readonly chapterNumber: number;
   readonly baselineChapter?: number;
+  readonly settlementGuidance?: string;
   readonly allowNewHooks?: boolean;
   readonly title: string;
   readonly content: string;
@@ -62,6 +63,7 @@ export async function retrySettlementAfterValidationFailure(
     content: params.content,
     allowReapply: true,
     baselineChapter: params.baselineChapter,
+    settlementGuidance: params.settlementGuidance,
     allowNewHooks: params.allowNewHooks,
     chapterIntent: params.reducedControlInput?.chapterIntent,
     contextPackage: params.reducedControlInput?.contextPackage,
@@ -184,6 +186,27 @@ export interface StateDegradedReviewNote {
   readonly injectedIssues: ReadonlyArray<string>;
 }
 
+/** Older audits could overwrite status while leaving the settlement failure in reviewNote. */
+export function isChapterStateDegraded(chapter: Pick<ChapterMeta, "status" | "reviewNote">): boolean {
+  return chapter.status === "state-degraded" || parseStateDegradedReviewNote(chapter.reviewNote) !== null;
+}
+
+export function markChapterStateDegraded(chapter: ChapterMeta): ChapterMeta {
+  const metadata = parseStateDegradedReviewNote(chapter.reviewNote);
+  return {
+    ...chapter,
+    status: "state-degraded",
+    updatedAt: new Date().toISOString(),
+    reviewNote: isChapterStateDegraded(chapter)
+      ? JSON.stringify({
+        kind: "state-degraded",
+        baseStatus: resolveStateDegradedBaseStatus(chapter),
+        injectedIssues: metadata?.injectedIssues ?? [],
+      } satisfies StateDegradedReviewNote)
+      : buildStateDegradedReviewNote("audit-failed", []),
+  };
+}
+
 export function buildStateDegradedReviewNote(
   baseStatus: "ready-for-review" | "audit-failed",
   issues: ReadonlyArray<AuditIssue>,
@@ -227,14 +250,19 @@ export function parseStateDegradedReviewNote(
 }
 
 export function resolveStateDegradedBaseStatus(
-  chapter: Pick<ChapterMeta, "reviewNote" | "auditIssues">,
+  chapter: Pick<ChapterMeta, "status" | "reviewNote" | "auditIssues">,
 ): "ready-for-review" | "audit-failed" {
   const metadata = parseStateDegradedReviewNote(chapter.reviewNote);
-  if (metadata) {
-    return metadata.baseStatus;
+  const injected = new Set(metadata?.injectedIssues ?? []);
+  const hasAuditCritical = chapter.auditIssues.some(
+    (issue) => issue.startsWith("[critical]") && !injected.has(issue),
+  );
+  if (chapter.status === "audit-failed" || hasAuditCritical) {
+    return "audit-failed";
+  }
+  if (chapter.status === "ready-for-review") {
+    return "ready-for-review";
   }
 
-  return chapter.auditIssues.some((issue) => issue.startsWith("[critical]"))
-    ? "audit-failed"
-    : "ready-for-review";
+  return metadata?.baseStatus ?? "ready-for-review";
 }

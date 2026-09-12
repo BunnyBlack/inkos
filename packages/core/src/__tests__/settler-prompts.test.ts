@@ -30,6 +30,17 @@ const GENRE: GenreProfile = {
 };
 
 describe("settler hook identity contract", () => {
+  it.each(["zh", "en"] as const)("renders independent settlement guidance in %s", language => {
+    const input = {
+      chapterNumber: 1, title: "One", content: "Body", currentState: "State", ledger: "", hooks: "Hooks",
+      chapterSummaries: "", subplotBoard: "", emotionalArcs: "", characterMatrix: "", volumeOutline: "", language,
+      settlementGuidance: "Keep the token in the coat",
+    };
+    const prompt = buildSettlerUserPrompt(input);
+    expect(prompt).toContain(input.settlementGuidance);
+    expect(prompt).toContain(language === "en" ? "persisted chapter text" : "已保存正文");
+    expect(buildSettlerUserPrompt({ ...input, settlementGuidance: "   " })).toBe(buildSettlerUserPrompt({ ...input, settlementGuidance: undefined }));
+  });
   it("assigns semantic identity to the settler and keeps host admission structural", () => {
     const prompt = buildSettlerSystemPrompt(BOOK, GENRE, null, "zh");
 

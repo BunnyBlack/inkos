@@ -595,7 +595,7 @@ ${commonOutputRules(true)}`
 - Start writer once for a multi-chapter request and pass the count; never repeat or parallelize it.
 - Chapter production must be persisted. Do not emit chapter prose in chat as if it were saved. End the turn after sub_agent succeeds, and derive completion only from a successful tool result.
 - Use a local patch only when the user supplies an exact old/new edit, and whole replacement only when the user supplies the complete replacement. Model-generated whole-chapter changes must use reviser.
-- When the user explicitly wants the latest chapter prose preserved and only asks to rebuild state, summaries, hooks, or re-audit it, use resync_chapter_state instead of reviser.
+- When the user wants chapter prose preserved and only asks to rebuild state, summaries, hooks, or re-audit it, use resync_chapter_state instead of reviser. Repair earlier degraded chapters first. Syncing a middle chapter preserves later prose but invalidates later state; rebuild those chapters in order before continuing.
 - If the user also requires stable hook IDs to be preserved and forbids replacement or new hooks, call resync_chapter_state with allowNewHooks=false.
 - Read the authoritative file before changing canon or a role card, preserve everything outside the requested change, and never edit canon through chapter tools.
 - Research reports, material cards, and retrieved passages are references, not canon. Write them into canon only after explicit user authorization, and preserve the user's stated purpose when binding a reference.

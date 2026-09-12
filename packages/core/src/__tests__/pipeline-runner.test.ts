@@ -2833,6 +2833,221 @@ describe("PipelineRunner", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it.each([true, false])("keeps legacy state degradation after an audit (passed=%s)", async (passed) => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const now = new Date().toISOString();
+      await state.saveChapterIndex(bookId, [{
+        number: 1, title: "Broken", status: "audit-failed", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+        reviewNote: JSON.stringify({ kind: "state-degraded", baseStatus: "audit-failed", injectedIssues: [] }),
+      }]);
+      await writeFile(join(state.bookDir(bookId), "chapters", "0001_Broken.md"), "Body", "utf-8");
+      vi.spyOn(runner as any, "evaluateMergedAudit").mockResolvedValue({ auditResult: createAuditResult({ passed }) });
+      await runner.auditDraft(bookId, 1);
+      const [chapter] = await state.loadChapterIndex(bookId);
+      expect(chapter?.status).toBe("state-degraded");
+      expect(JSON.parse(chapter!.reviewNote!).baseStatus).toBe(passed ? "ready-for-review" : "audit-failed");
+      await expect(runner.writeNextChapter(bookId)).rejects.toThrow(/state-degraded/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks continuation when an older chapter only has a legacy degraded review note", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const now = new Date().toISOString();
+      await state.saveChapterIndex(bookId, [1, 2].map((number) => ({
+        number, title: "Chapter", status: "ready-for-review", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+        reviewNote: number === 1 ? JSON.stringify({ kind: "state-degraded", baseStatus: "audit-failed", injectedIssues: [] }) : undefined,
+      })));
+      await expect(runner.writeNextChapter(bookId)).rejects.toThrow(/chapter 1.*state-degraded/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["repair", "sync"])("%s rebuilds a middle chapter and invalidates later state without deleting bodies", async (operation) => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const now = new Date().toISOString();
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      await writeFile(join(storyDir, "current_state.md"), "baseline state", "utf-8");
+      await writeFile(join(storyDir, "pending_hooks.md"), "baseline hooks", "utf-8");
+      await state.snapshotState(bookId, 0);
+      await state.snapshotState(bookId, 2);
+      await state.saveChapterIndex(bookId, [1, 2].map((number) => ({
+        number, title: `Chapter ${number}`, status: number === 1 ? "audit-failed" : "ready-for-review", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: number === 1 ? ["[critical] unresolved body contradiction"] : [], lengthWarnings: [],
+        reviewNote: number === 1 ? JSON.stringify({ kind: "state-degraded", baseStatus: "ready-for-review", injectedIssues: [] }) : undefined,
+      })));
+      for (const number of [1, 2]) {
+        await writeFile(join(bookDir, "chapters", `000${number}_Chapter.md`), `Body ${number}`, "utf-8");
+      }
+      vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async (input) => createWriterOutput({
+        chapterNumber: input.chapterNumber, title: input.title, content: input.content,
+        updatedState: `fixed state ${input.chapterNumber}`, updatedHooks: "fixed hooks",
+      }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: true, warnings: [] });
+
+      if (operation === "repair") await runner.repairChapterState(bookId, 1);
+      else await runner.resyncChapterArtifacts(bookId, 1);
+
+      const index = await state.loadChapterIndex(bookId);
+      expect(index[0]?.status).toBe("audit-failed");
+      expect(index[0]?.auditIssues).toEqual(["[critical] unresolved body contradiction"]);
+      expect(index[0]?.reviewNote).toBeUndefined();
+      expect(index[1]?.status).toBe("state-degraded");
+      await expect(readFile(join(bookDir, "chapters", "0002_Chapter.md"), "utf-8")).resolves.toBe("Body 2");
+      await expect(stat(join(storyDir, "snapshots", "2"))).rejects.toThrow();
+      await expect(readFile(join(storyDir, "snapshots", "1", "current_state.md"), "utf-8")).resolves.toBe("fixed state 1");
+      expect(JSON.parse(await readFile(join(storyDir, "snapshots", "1", "state", "manifest.json"), "utf-8")).lastAppliedChapter).toBe(1);
+      await expect(runner.writeNextChapter(bookId)).rejects.toThrow(/state-degraded/i);
+
+      await runner.repairChapterState(bookId, 2);
+      await expect(readFile(join(storyDir, "snapshots", "2", "current_state.md"), "utf-8")).resolves.toBe("fixed state 2");
+      expect((await state.loadChapterIndex(bookId))[1]?.reviewNote).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("middle sync preserves explicit guidance and baseline through retry=%s", async (retry) => {
+    const guidance = "Keep the token in the coat";
+    const { root, runner, state, bookId } = await createRunnerFixture({ externalContext: guidance });
+    try {
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      const now = new Date().toISOString();
+      await writeFile(join(storyDir, "current_state.md"), "baseline zero", "utf-8");
+      await writeFile(join(storyDir, "pending_hooks.md"), "baseline hooks", "utf-8");
+      await state.snapshotState(bookId, 0);
+      await writeFile(join(storyDir, "current_state.md"), "FUTURE_ONLY_MARKER", "utf-8");
+      await state.saveChapterIndex(bookId, [1, 2].map(number => ({
+        number, title: `Chapter ${number}`, status: "ready-for-review", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+      })));
+      for (const number of [1, 2]) await writeFile(join(bookDir, "chapters", `000${number}_Chapter.md`), `Body ${number}`, "utf-8");
+      const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async input => createWriterOutput({
+        chapterNumber: input.chapterNumber, title: input.title, content: input.content,
+      }));
+      const validate = vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: true, warnings: [] });
+      if (retry) validate.mockResolvedValueOnce({ passed: false, warnings: [] });
+      await runner.resyncChapterArtifacts(bookId, 1);
+      expect(settle).toHaveBeenCalledTimes(retry ? 2 : 1);
+      for (const [input] of settle.mock.calls) {
+        expect(input).toMatchObject({ settlementGuidance: guidance, baselineChapter: 0 });
+        expect(input.contextPackage).toBeUndefined();
+      }
+      for (const call of validate.mock.calls) expect(call[2]).toBe("baseline zero");
+      await expect(readFile(join(bookDir, "chapters", "0002_Chapter.md"), "utf-8")).resolves.toBe("Body 2");
+      expect((await state.loadChapterIndex(bookId))[1]?.status).toBe("state-degraded");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["repair", "sync"])("%s retains legacy audit failure after an interrupted save and retry", async operation => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      const now = new Date().toISOString();
+      await writeFile(join(storyDir, "current_state.md"), "baseline zero", "utf-8");
+      await writeFile(join(storyDir, "pending_hooks.md"), "baseline hooks", "utf-8");
+      await state.snapshotState(bookId, 0);
+      await writeFile(join(bookDir, "chapters", "0001_Chapter.md"), "Body 1", "utf-8");
+      await state.saveChapterIndex(bookId, [{
+        number: 1, title: "Chapter", status: "audit-failed", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+        reviewNote: JSON.stringify({ kind: "state-degraded", baseStatus: "ready-for-review", injectedIssues: [] }),
+      }]);
+      vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async input => createWriterOutput({
+        chapterNumber: input.chapterNumber, title: input.title, content: input.content,
+      }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: true, warnings: [] });
+      const save = vi.spyOn(WriterAgent.prototype, "saveChapter").mockRejectedValueOnce(new Error("simulated persistence failure"));
+      const run = () => operation === "repair" ? runner.repairChapterState(bookId, 1) : runner.resyncChapterArtifacts(bookId, 1);
+      await expect(run()).rejects.toThrow("simulated persistence failure");
+      const [pending] = await state.loadChapterIndex(bookId);
+      expect(JSON.parse(pending!.reviewNote!).baseStatus).toBe("audit-failed");
+      save.mockRestore();
+      const result = await run();
+      expect(result.status).toBe("audit-failed");
+      expect(result.auditResult.passed).toBe(false);
+      expect((await state.loadChapterIndex(bookId))[0]?.reviewNote).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("replays real runtime deltas through retained chapters without advancing the baseline early", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const now = new Date().toISOString();
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      await writeFile(join(storyDir, "current_state.md"), "Initial state", "utf-8");
+      await writeFile(join(storyDir, "pending_hooks.md"), "No hooks", "utf-8");
+      await state.snapshotState(bookId, 0);
+      await state.saveChapterIndex(bookId, [1, 2, 3].map((number) => ({
+        number, title: `Chapter ${number}`, status: "state-degraded", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+      })));
+      for (const number of [1, 2, 3]) await writeFile(join(bookDir, "chapters", `000${number}_Chapter.md`), `Body ${number}`, "utf-8");
+      const { buildRuntimeStateArtifactsFromSnapshot, loadRuntimeStateSnapshotAtChapter } = await import("../state/runtime-state-store.js");
+      vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async (input) => {
+        const output = createSettledRevisionOutput(input);
+        const snapshot = await loadRuntimeStateSnapshotAtChapter({ bookDir, chapterNumber: input.baselineChapter!, language: "en" });
+        const artifacts = buildRuntimeStateArtifactsFromSnapshot({
+          snapshot, delta: output.runtimeStateDelta!, language: "en", allowReapply: true,
+        });
+        return { ...output, runtimeStateSnapshot: artifacts.snapshot };
+      });
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: true, warnings: [] });
+      await expect(runner.repairChapterState(bookId, 2)).rejects.toThrow(/chapter 1.*state-degraded/i);
+      for (const number of [1, 2, 3]) {
+        await runner.repairChapterState(bookId, number);
+        const manifest = JSON.parse(await readFile(join(storyDir, "snapshots", String(number), "state", "manifest.json"), "utf-8"));
+        expect(manifest.lastAppliedChapter).toBe(number);
+        expect(await state.getNextChapterNumber(bookId)).toBe(4);
+        const liveManifest = JSON.parse(await readFile(join(storyDir, "state", "manifest.json"), "utf-8"));
+        expect(liveManifest.lastAppliedChapter).toBe(number);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["repair", "sync"])("%s leaves state unchanged when validation still requires repair", async (operation) => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const now = new Date().toISOString();
+      const bookDir = state.bookDir(bookId);
+      const storyDir = join(bookDir, "story");
+      await writeFile(join(storyDir, "current_state.md"), "original state", "utf-8");
+      await writeFile(join(storyDir, "pending_hooks.md"), "original hooks", "utf-8");
+      await state.snapshotState(bookId, 0);
+      await state.saveChapterIndex(bookId, [{
+        number: 1, title: "Broken", status: "state-degraded", wordCount: 10,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [],
+      }]);
+      await writeFile(join(bookDir, "chapters", "0001_Broken.md"), "Original body", "utf-8");
+      vi.spyOn(WriterAgent.prototype, "settleChapterState").mockResolvedValue(createWriterOutput());
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: true, repairRequired: true, warnings: [] });
+      const result = operation === "repair" ? runner.repairChapterState(bookId, 1) : runner.resyncChapterArtifacts(bookId, 1);
+      await expect(result).rejects.toThrow();
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("original state");
+      await expect(readFile(join(bookDir, "chapters", "0001_Broken.md"), "utf-8")).resolves.toBe("Original body");
+      expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("state-degraded");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("repairs the latest state-degraded chapter from persisted body without rewriting it", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture({
     });

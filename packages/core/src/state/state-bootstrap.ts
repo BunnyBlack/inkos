@@ -1,5 +1,7 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isChapterStateDegraded } from "../pipeline/chapter-state-recovery.js";
+import type { ChapterMeta } from "../models/chapter.js";
 import {
   ChapterSummariesStateSchema,
   CurrentStateStateSchema,
@@ -90,7 +92,7 @@ export async function bootstrapStructuredStateFromMarkdown(params: {
     warnings,
     bootstrapState: markdownState.currentState,
   });
-  // Only trust durable artifact progress (chapter files + index).
+  // Body persistence is not settlement: a degraded chapter caps inferred progress.
   // currentState.chapter comes from markdown which can contain
   // hallucinated numbers (e.g. year 1988 parsed as chapter 1988).
   const derivedProgress = markdownState.durableStoryProgress;
@@ -144,6 +146,7 @@ export async function rewriteStructuredStateFromMarkdown(params: {
     bookDir: params.bookDir,
     storyDir,
     fallbackChapter: params.fallbackChapter ?? 0,
+    validatedSettlementChapter: params.fallbackChapter,
     warnings,
   });
   const summariesState = markdownState.summariesState;
@@ -470,6 +473,7 @@ async function loadMarkdownBootstrapState(params: {
   readonly bookDir: string;
   readonly storyDir: string;
   readonly fallbackChapter: number;
+  readonly validatedSettlementChapter?: number;
   readonly warnings: string[];
 }): Promise<MarkdownBootstrapState> {
   const summariesState = await loadMarkdownSummariesState(params.storyDir);
@@ -479,7 +483,17 @@ async function loadMarkdownBootstrapState(params: {
   });
   const explicitFallback = normalizeExplicitChapter(params.fallbackChapter);
   const durableArtifactProgress = await resolveContiguousArtifactChapterProgress(params.bookDir);
-  const authoritativeProgress = Math.max(explicitFallback, durableArtifactProgress);
+  const index = await readFile(join(params.bookDir, "chapters", "index.json"), "utf-8")
+    .then((raw) => JSON.parse(raw) as ChapterMeta[])
+    .catch(() => [] as ChapterMeta[]);
+  const firstDegraded = index.filter(isChapterStateDegraded)
+    .reduce((first, chapter) => Math.min(first, chapter.number), Infinity);
+  // Ordinary readers also pass fallbackChapter. Only an explicit rewrite of validated
+  // settlement may advance past the guard while its persistence is still in flight.
+  const authoritativeProgress = Math.max(
+    normalizeExplicitChapter(params.validatedSettlementChapter),
+    Math.min(Math.max(explicitFallback, durableArtifactProgress), firstDegraded - 1),
+  );
   const currentState = await loadMarkdownCurrentState({
     storyDir: params.storyDir,
     fallbackChapter: authoritativeProgress,

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
+import { markChapterStateDegraded } from "../pipeline/chapter-state-recovery.js";
 import { bootstrapStructuredStateFromMarkdown, resolveDurableStoryProgress } from "./state-bootstrap.js";
 
 const BOOK_LOCK_HEARTBEAT_MS = 30_000;
@@ -717,7 +718,12 @@ export class StateManager {
   async rollbackToChapter(
     bookId: string,
     targetChapter: number,
+    options: { readonly keepChaptersThrough?: number } = {},
   ): Promise<ReadonlyArray<number>> {
+    const keepThrough = options.keepChaptersThrough ?? targetChapter;
+    if (!Number.isInteger(keepThrough) || keepThrough < targetChapter) {
+      throw new Error("Cannot keep fewer chapters than the restored state snapshot.");
+    }
     const restored = await this.restoreState(bookId, targetChapter);
     if (!restored) {
       throw new Error(`Cannot restore snapshot for chapter ${targetChapter} in "${bookId}"`);
@@ -731,8 +737,8 @@ export class StateManager {
     const discarded: number[] = [];
 
     for (const entry of index) {
-      if (entry.number <= targetChapter) {
-        kept.push(entry);
+      if (entry.number <= keepThrough) {
+        kept.push(entry.number > targetChapter ? markChapterStateDegraded(entry) : entry);
       } else {
         discarded.push(entry.number);
       }
@@ -745,7 +751,7 @@ export class StateManager {
         const match = file.match(/^(\d+)_.*\.md$/);
         if (!match) continue;
         const num = parseInt(match[1]!, 10);
-        if (num > targetChapter) {
+        if (num > keepThrough) {
           await unlink(join(chaptersDir, file)).catch(() => {});
         }
       }
@@ -775,6 +781,7 @@ export class StateManager {
         const match = file.match(/^chapter-(\d+)\./);
         if (!match) continue;
         const num = parseInt(match[1]!, 10);
+        if (num <= keepThrough && file.endsWith(".user-brief.md")) continue;
         if (num > targetChapter) {
           await unlink(join(runtimeDir, file)).catch(() => {});
         }
@@ -791,7 +798,7 @@ export class StateManager {
         const match = file.match(/^(\d+)_.*\.md$/);
         if (!match) continue;
         const num = parseInt(match[1]!, 10);
-        if (num > targetChapter) {
+        if (num > keepThrough) {
           await unlink(join(draftsDir, file)).catch(() => {});
         }
       }
@@ -809,6 +816,28 @@ export class StateManager {
 
     await this.saveChapterIndex(bookId, kept);
     return discarded;
+  }
+
+  /** Invalidate settlement and dependent snapshots, retaining every chapter body. */
+  async invalidateChapterStateFrom(bookId: string, chapterNumber: number): Promise<void> {
+    const index = await this.loadChapterIndex(bookId);
+    // Persist the guard first: an interrupted rebuild must remain visibly repairable.
+    await this.saveChapterIndex(bookId, index.map((chapter) =>
+      chapter.number >= chapterNumber ? markChapterStateDegraded(chapter) : chapter,
+    ));
+    const snapshotsDir = join(this.bookDir(bookId), "story", "snapshots");
+    const snapshots = await readdir(snapshotsDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const snapshot of snapshots) {
+      if (/^\d+$/.test(snapshot) && Number(snapshot) >= chapterNumber) {
+        await rm(join(snapshotsDir, snapshot), { recursive: true, force: true });
+      }
+    }
+    for (const file of ["memory.db", "memory.db-shm", "memory.db-wal"]) {
+      await rm(join(this.bookDir(bookId), "story", file), { force: true });
+    }
   }
 
   private async writeIfMissing(path: string, content: string): Promise<void> {

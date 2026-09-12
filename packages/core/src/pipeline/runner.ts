@@ -50,6 +50,7 @@ import { rewriteStructuredStateFromMarkdown } from "../state/state-bootstrap.js"
 import { readFile, readdir, writeFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  isChapterStateDegraded,
   parseStateDegradedReviewNote,
   resolveStateDegradedBaseStatus,
   retrySettlementAfterValidationFailure,
@@ -1288,8 +1289,17 @@ export class PipelineRunner {
     };
   }
 
-  /** Audit the latest (or specified) chapter. Read-only, no lock needed. */
+  /** Auditing updates the index and guidance, so it shares the book mutation lock. */
   async auditDraft(bookId: string, chapterNumber?: number): Promise<AuditResult & { readonly chapterNumber: number }> {
+    const releaseLock = await this.state.acquireBookLock(bookId);
+    try {
+      return await this._auditDraftLocked(bookId, chapterNumber);
+    } finally {
+      await releaseLock();
+    }
+  }
+
+  private async _auditDraftLocked(bookId: string, chapterNumber?: number): Promise<AuditResult & { readonly chapterNumber: number }> {
     const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
     const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
@@ -1321,7 +1331,10 @@ export class PipelineRunner {
       ch.number === targetChapter
         ? {
             ...ch,
-            status: (result.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
+            status: (isChapterStateDegraded(ch) ? "state-degraded" : result.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
+            reviewNote: isChapterStateDegraded(ch)
+              ? JSON.stringify({ kind: "state-degraded", baseStatus: result.passed ? "ready-for-review" : "audit-failed", injectedIssues: [] })
+              : ch.reviewNote,
             updatedAt: new Date().toISOString(),
             auditIssues: result.issues.map((i) => `[${i.severity}] ${i.description}`),
           }
@@ -1329,7 +1342,7 @@ export class PipelineRunner {
     );
     await this.state.saveChapterIndex(bookId, updated);
     const latestChapter = index.length > 0 ? Math.max(...index.map((chapter) => chapter.number)) : targetChapter;
-    if (targetChapter === latestChapter) {
+    if (targetChapter === latestChapter && !updated.some(isChapterStateDegraded)) {
       await this.persistAuditDriftGuidance({
         bookDir,
         chapterNumber: targetChapter,
@@ -1894,7 +1907,7 @@ export class PipelineRunner {
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
       const chapter = await this._resyncChapterArtifactsLocked(bookId, chapterNumber, options);
-      const audit = await this.auditDraft(bookId, chapter.chapterNumber);
+      const audit = await this._auditDraftLocked(bookId, chapter.chapterNumber);
       return { chapter, audit };
     } finally {
       await releaseLock();
@@ -2402,12 +2415,10 @@ export class PipelineRunner {
     }
     const targetMeta = index[targetIndex]!;
     const latestChapter = Math.max(...index.map((chapter) => chapter.number));
-    if (targetMeta.status !== "state-degraded") {
+    if (!isChapterStateDegraded(targetMeta)) {
       throw new Error(`Chapter ${targetChapter} is not state-degraded.`);
     }
-    if (targetChapter !== latestChapter) {
-      throw new Error(`Only the latest state-degraded chapter can be repaired safely (latest is ${latestChapter}).`);
-    }
+    await this.assertNoPendingStateRepair(bookId, targetChapter);
 
     this.logStage(stageLanguage, { zh: "修复章节状态结算", en: "repairing chapter state settlement" });
     const { profile: gp } = await this.loadGenreProfile(book.genre);
@@ -2445,7 +2456,7 @@ export class PipelineRunner {
       pipelineLang,
     );
 
-    if (!validation.passed) {
+    if (!validation.passed || validation.repairRequired) {
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
         validator,
@@ -2472,15 +2483,17 @@ export class PipelineRunner {
       validation = recovery.validation;
     }
 
-    if (!validation.passed) {
+    if (!validation.passed || validation.repairRequired) {
       throw new Error(`State repair still failed for chapter ${targetChapter}.`);
     }
 
+    await this.state.invalidateChapterStateFrom(bookId, targetChapter);
+    if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
+      throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state repair.`);
+    }
     await writer.saveChapter(bookDir, repairedOutput, gp.numericalSystem, pipelineLang);
     await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, repairedOutput);
-    await this.syncNarrativeMemoryIndex(bookId);
     await this.state.snapshotState(bookId, targetChapter);
-    await this.syncCurrentStateFactHistory(bookId, targetChapter);
 
     const baseStatus = resolveStateDegradedBaseStatus(targetMeta);
     const degradedMetadata = parseStateDegradedReviewNote(targetMeta.reviewNote);
@@ -2492,9 +2505,13 @@ export class PipelineRunner {
       auditIssues: targetMeta.auditIssues.filter((issue) => !injectedIssues.has(issue)),
       reviewNote: undefined,
     };
-    await this.state.saveChapterIndex(bookId, index);
+    await this.state.saveChapterIndex(bookId, (await this.state.loadChapterIndex(bookId)).map((chapter) =>
+      chapter.number === targetChapter ? index[targetIndex]! : chapter,
+    ));
 
     const repairedPassesAudit = baseStatus !== "audit-failed";
+    await this.syncNarrativeMemoryIndex(bookId);
+    await this.syncCurrentStateFactHistory(bookId, targetChapter);
     return {
       chapterNumber: targetChapter,
       title: targetMeta.title,
@@ -2533,9 +2550,7 @@ export class PipelineRunner {
 
     const targetMeta = index[targetIndex]!;
     const latestChapter = Math.max(...index.map((chapter) => chapter.number));
-    if (targetChapter !== latestChapter) {
-      throw new Error(`Only the latest persisted chapter can be synced safely (latest is ${latestChapter}).`);
-    }
+    await this.assertNoPendingStateRepair(bookId, targetChapter);
 
     this.logStage(stageLanguage, { zh: "根据已编辑正文同步真相文件与索引", en: "syncing truth files and indexes from edited chapter body" });
     const { profile: gp } = await this.loadGenreProfile(book.genre);
@@ -2552,13 +2567,18 @@ export class PipelineRunner {
       );
     });
 
-    const reducedControlInput = await this.createGovernedArtifacts(
+    const reducedControlInput = targetChapter !== latestChapter ? undefined : await this.createGovernedArtifacts(
       book,
       bookDir,
       targetChapter,
       this.config.externalContext,
       { reuseExistingIntentWhenContextMissing: true },
     );
+    // Latest-chapter context already carries the brief. Middle chapters use only
+    // their snapshot baseline plus explicit guidance, never future live context.
+    const settlementGuidance = targetChapter !== latestChapter
+      ? this.config.externalContext?.trim() || undefined
+      : undefined;
 
     const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
     let syncedOutput = await writer.settleChapterState({
@@ -2567,6 +2587,7 @@ export class PipelineRunner {
       chapterNumber: targetChapter,
       baselineChapter,
       allowNewHooks: options.allowNewHooks,
+      settlementGuidance,
       title: targetMeta.title,
       content,
       chapterIntent: reducedControlInput?.plan.intentMarkdown,
@@ -2585,7 +2606,7 @@ export class PipelineRunner {
       pipelineLang,
     );
 
-    if (!validation.passed) {
+    if (!validation.passed || validation.repairRequired) {
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
         validator,
@@ -2594,6 +2615,7 @@ export class PipelineRunner {
         chapterNumber: targetChapter,
         baselineChapter,
         allowNewHooks: options.allowNewHooks,
+        settlementGuidance,
         title: targetMeta.title,
         content,
         reducedControlInput: reducedControlInput
@@ -2620,21 +2642,23 @@ export class PipelineRunner {
       validation = recovery.validation;
     }
 
-    if (!validation.passed) {
+    if (!validation.passed || validation.repairRequired) {
       throw new Error(`Chapter sync still failed for chapter ${targetChapter}.`);
     }
 
+    await this.state.invalidateChapterStateFrom(bookId, targetChapter);
+    if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
+      throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state sync.`);
+    }
     await writer.saveChapter(bookDir, syncedOutput, gp.numericalSystem, pipelineLang);
     await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, syncedOutput);
-    await this.syncNarrativeMemoryIndex(bookId);
     await this.state.snapshotState(bookId, targetChapter);
-    await this.syncCurrentStateFactHistory(bookId, targetChapter);
 
-    const finalStatus: "ready-for-review" | "audit-failed" = targetMeta.status === "state-degraded"
+    const finalStatus: "ready-for-review" | "audit-failed" = isChapterStateDegraded(targetMeta)
       ? resolveStateDegradedBaseStatus(targetMeta)
       : "ready-for-review";
 
-    if (targetMeta.status === "state-degraded") {
+    if (isChapterStateDegraded(targetMeta)) {
       const degradedMetadata = parseStateDegradedReviewNote(targetMeta.reviewNote);
       const injectedIssues = new Set(degradedMetadata?.injectedIssues ?? []);
       index[targetIndex] = {
@@ -2651,7 +2675,11 @@ export class PipelineRunner {
         updatedAt: new Date().toISOString(),
       };
     }
-    await this.state.saveChapterIndex(bookId, index);
+    await this.state.saveChapterIndex(bookId, (await this.state.loadChapterIndex(bookId)).map((chapter) =>
+      chapter.number === targetChapter ? index[targetIndex]! : chapter,
+    ));
+    await this.syncNarrativeMemoryIndex(bookId);
+    await this.syncCurrentStateFactHistory(bookId, targetChapter);
     return {
       chapterNumber: targetChapter,
       title: targetMeta.title,
@@ -3243,15 +3271,16 @@ ${matrix}`,
     };
   }
 
-  private async assertNoPendingStateRepair(bookId: string): Promise<void> {
+  private async assertNoPendingStateRepair(bookId: string, beforeChapter = Infinity): Promise<void> {
     const existingIndex = await this.state.loadChapterIndex(bookId);
-    const latestChapter = [...existingIndex].sort((left, right) => right.number - left.number)[0];
-    if (latestChapter?.status !== "state-degraded") {
+    const pendingChapter = [...existingIndex].sort((left, right) => left.number - right.number)
+      .find((chapter) => chapter.number < beforeChapter && isChapterStateDegraded(chapter));
+    if (!pendingChapter) {
       return;
     }
 
     throw new Error(
-      `Latest chapter ${latestChapter.number} is state-degraded. Repair state or rewrite that chapter before continuing.`,
+      `Chapter ${pendingChapter.number} is state-degraded. Run write repair-state or write sync for chapter ${pendingChapter.number} before continuing.`,
     );
   }
 

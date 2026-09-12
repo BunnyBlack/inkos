@@ -5,6 +5,10 @@ const KNOWN_RUNTIME_REPLACEMENTS: ReadonlyArray<{
   readonly replacement: string;
 }> = [
   {
+    pattern: /Chapter (\d+) is state-degraded\. Run write repair-state or write sync for chapter \d+ before continuing\./g,
+    replacement: "第 $1 章处于状态降级（state-degraded）。请先按章号顺序修复状态或同步正文，再继续。",
+  },
+  {
     pattern: /Latest chapter (\d+) is state-degraded\. Repair state or rewrite that chapter before continuing\./g,
     replacement: "最新第 $1 章处于状态降级（state-degraded）。继续写下一章前，请先修复状态，或重写这一章。",
   },
