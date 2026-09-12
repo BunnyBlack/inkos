@@ -88,6 +88,7 @@ export interface SettleChapterStateInput {
   readonly contextPackage?: ContextPackage;
   readonly ruleStack?: RuleStack;
   readonly validationFeedback?: string;
+  readonly previousSettlement?: WriteChapterOutput;
   readonly settlementGuidance?: string;
 }
 
@@ -449,6 +450,7 @@ export class WriterAgent extends BaseAgent {
       contextPackage: input.contextPackage,
       ruleStack: input.ruleStack,
       validationFeedback: input.validationFeedback,
+      previousSettlement: input.previousSettlement,
       settlementGuidance: input.settlementGuidance,
       originalHooks: hooks,
       originalSubplots: subplotBoard,
@@ -514,6 +516,7 @@ export class WriterAgent extends BaseAgent {
     readonly contextPackage?: ContextPackage;
     readonly ruleStack?: RuleStack;
     readonly validationFeedback?: string;
+    readonly previousSettlement?: WriteChapterOutput;
     readonly settlementGuidance?: string;
     readonly originalHooks: string;
     readonly originalSubplots: string;
@@ -577,6 +580,7 @@ export class WriterAgent extends BaseAgent {
       selectedEvidenceBlock: params.selectedEvidenceBlock,
       governedControlBlock,
       validationFeedback: params.validationFeedback,
+      previousSettlement: params.previousSettlement,
       settlementGuidance: params.settlementGuidance,
       language: resolvedLang,
     });
@@ -636,7 +640,7 @@ export class WriterAgent extends BaseAgent {
     output: WriteChapterOutput,
     numericalSystem: boolean = true,
     language: "zh" | "en" = "zh",
-    options: { readonly preserveBody?: boolean } = {},
+    options: { readonly preserveBody?: boolean; readonly preserveTruth?: boolean } = {},
   ): Promise<void> {
     const chaptersDir = join(bookDir, "chapters");
     await mkdir(chaptersDir, { recursive: true });
@@ -657,6 +661,16 @@ export class WriterAgent extends BaseAgent {
       "",
       output.content,
     ].join("\n");
+    if (options.preserveTruth) {
+      if (!options.preserveBody) {
+        await commitAtomicFileSet({
+          rootDir: bookDir,
+          writes: [{ relativePath: join("chapters", filename), content: chapterContent }],
+          deletes: supersededChapterFiles.map((file) => join("chapters", file)),
+        });
+      }
+      return;
+    }
     const runtimeStateArtifacts = await this.resolveRuntimeStateArtifactsForOutput(
       bookDir,
       output,

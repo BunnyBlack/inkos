@@ -54,7 +54,7 @@ export async function assertAuthorDocumentPath(booksRoot: string, target: string
 
 export function productionOperation(name: string, args: Record<string, unknown>): string | undefined {
   if (name === "sub_agent" && ["writer", "reviser"].includes(String(args.agent))) return "chapter-production";
-  if (["resync_chapter_state", "recover_chapters", "recover_transaction", "resume_revision_candidate"].includes(name)) return "chapter-production";
+  if (["resync_chapter_state", "recover_chapters", "recover_transaction", "resume_revision_candidate", "resume_settlement_attempt"].includes(name)) return "chapter-production";
   return undefined;
 }
 

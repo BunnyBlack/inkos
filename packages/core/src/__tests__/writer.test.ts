@@ -56,6 +56,26 @@ function createCaptureLogger() {
 }
 
 describe("WriterAgent", () => {
+  it("preserves every truth artifact when saving a degraded chapter body", async () => {
+    const root = await mkdtemp(join(tmpdir(), "inkos-writer-preserve-truth-"));
+    const storyDir = join(root, "story");
+    await mkdir(join(storyDir, "state"), { recursive: true });
+    const paths = ["current_state.md", "pending_hooks.md", "chapter_summaries.md", "subplot_board.md", "emotional_arcs.md", "character_matrix.md", "particle_ledger.md", "state/manifest.json", "state/current_state.json", "state/hooks.json", "state/chapter_summaries.json"];
+    await Promise.all(paths.map(path => writeFile(join(storyDir, path), `original ${path}`, "utf8")));
+    const agent = new WriterAgent({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} } }, model: "test-model", projectRoot: root });
+    try {
+      await agent.saveChapter(root, {
+        chapterNumber: 1, title: "One", content: "Retained body", wordCount: 2, preWriteCheck: "", postSettlement: "",
+        updatedState: "rejected state", updatedLedger: "rejected ledger", updatedHooks: "rejected hooks", chapterSummary: "rejected summary",
+        updatedChapterSummaries: "rejected summaries", updatedSubplots: "rejected subplots", updatedEmotionalArcs: "rejected arcs", updatedCharacterMatrix: "rejected matrix", postWriteErrors: [], postWriteWarnings: [],
+        runtimeStateSnapshot: { manifest: { schemaVersion: 2, language: "en", lastAppliedChapter: 1, projectionVersion: 1, migrationWarnings: [] }, currentState: { chapter: 1, facts: [] }, hooks: { hooks: [] }, chapterSummaries: { rows: [] } },
+      }, true, "en", { preserveTruth: true });
+      for (const path of paths) expect(await readFile(join(storyDir, path), "utf8")).toBe(`original ${path}`);
+      expect(await readFile(join(root, "chapters", "0001_One.md"), "utf8")).toContain("Retained body");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   afterEach(() => {
     vi.restoreAllMocks();
   });

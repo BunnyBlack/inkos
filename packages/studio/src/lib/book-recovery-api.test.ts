@@ -1,6 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { requestBookRecovery, recoveryChapterTargets } from "./book-recovery-api";
+import { requestBookRecovery, recoveryChapterTargets, mergeRecoveryResult } from "./book-recovery-api";
 afterEach(() => vi.unstubAllGlobals());
+it("clears rejected-operation diagnostics after successful settlement while preserving status options", () => {
+  const next = mergeRecoveryResult({ status: "failed", reasonCode: "SETTLEMENT_NO_PROGRESS", error: "old error", stage: "validation", issues: ["old issue"], nextActions: ["inspect"], completed: [1], attemptId: "old", candidates: [], settlementAttempts: [] }, {}, { status: "applied", attemptId: "new" });
+  expect(next).toEqual({ status: "applied", attemptId: "new", candidates: [], settlementAttempts: [] });
+});
 it("offers diagnosed orphan chapters alongside indexed chapters", () => {
   expect(recoveryChapterTargets([1], [2])).toEqual([1, 2]);
   expect(recoveryChapterTargets([], [3, 1, 2, 2, 0, -1, 1.5])).toEqual([1, 2, 3]);

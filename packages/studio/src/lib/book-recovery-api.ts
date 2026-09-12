@@ -1,4 +1,11 @@
 export interface RecoveryView {
+  settlementAttempts?: Array<{ attemptId: string; chapter: number; status: string; reasonCode?: string; resumable: boolean }>;
+  attempt?: { attemptId: string; chapter: number; status: string; [key: string]: unknown };
+  events?: Array<{ type: string; [key: string]: unknown }>;
+  attemptId?: string;
+  stage?: string;
+  issues?: unknown[];
+  nextActions?: unknown[];
   candidates?: Array<{ candidateId: string; chapter?: number | null; status?: string; policySource?: "candidate" | "legacy-selection" | "missing"; publicationPolicy?: { revisionGate: "strict" | "lenient" | "always" } }>;
   availableBaselineBackup?: { backupId: string; chapter: 0 } | null;
   health?: { stateFrontier: number | null; pendingChapters: number[]; pendingOperationId?: string; issues: Array<{ code: string }> };
@@ -14,6 +21,13 @@ export interface RecoveryView {
 
 export function recoveryChapterTargets(indexed: readonly number[], pending: readonly number[] = []): number[] {
   return [...new Set([...indexed, ...pending])].filter(chapter => Number.isSafeInteger(chapter) && chapter > 0).sort((a, b) => a - b);
+}
+
+/** Retain inspection context, but never carry a previous operation's failure into a new result. */
+export function mergeRecoveryResult(current: RecoveryView | null, latest: RecoveryView, result: RecoveryView): RecoveryView {
+  const context: RecoveryView = { ...current };
+  for (const key of ["status", "applied", "candidateId", "attemptId", "completed", "reasonCode", "error", "stage", "issues", "nextActions", "auditResult"] as const) delete context[key];
+  return { ...context, ...latest, ...result };
 }
 
 /** Business rejection bodies remain available to show recovery and candidate details. */

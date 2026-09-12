@@ -3,6 +3,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { safeChildPath } from "../utils/path-safety.js";
+import type { LLMMessage } from "../llm/provider.js";
+import { checkValidationEvidence, groundedValidationIssueSchema, type GroundedValidationIssue, type ValidationEvidenceSources } from "./state-validation-evidence.js";
 
 export interface ValidationWarning {
   readonly category: string;
@@ -13,6 +15,18 @@ export interface ValidationResult {
   readonly warnings: ReadonlyArray<ValidationWarning>;
   readonly passed: boolean;
   readonly repairRequired?: boolean;
+  readonly issues?: ReadonlyArray<GroundedValidationIssue>;
+}
+
+export type StateValidationDiagnostic = {
+  readonly attempt: 1 | 2;
+  readonly chapterNumber: number;
+  readonly model: string;
+} & ({ readonly phase: "request"; readonly messages: ReadonlyArray<LLMMessage> }
+  | { readonly phase: "response"; readonly response: string });
+
+export interface StateValidationOptions {
+  readonly onDiagnostic?: (event: StateValidationDiagnostic) => Promise<void> | void;
 }
 
 export interface StateValidationAuthorityContext {
@@ -25,9 +39,9 @@ export interface StateValidationAuthorityContext {
  * Validates Settler output by comparing old and new truth files via LLM.
  * Catches contradictions, missing state changes, and temporal inconsistencies.
  *
- * Uses a minimal verdict protocol instead of requiring structured JSON:
- *   Line 1: PASS, REPAIR, or FAIL
- *   Remaining lines: free-form warnings (one per line, optional category prefix)
+ * Blocking opinions require structured, source-grounded evidence. Legacy verdicts
+ * remain parseable, but legacy blockers receive one evidence-completion request.
+ * Quote verification establishes provenance, not semantic correctness.
  */
 export class StateValidatorAgent extends BaseAgent {
   get name(): string {
@@ -43,14 +57,10 @@ export class StateValidatorAgent extends BaseAgent {
     newHooks: string,
     language: "zh" | "en" = "zh",
     authorityContext?: StateValidationAuthorityContext,
+    options?: StateValidationOptions,
   ): Promise<ValidationResult> {
     const stateDiff = this.computeDiff(oldState, newState, "State Card");
     const hooksDiff = this.computeDiff(oldHooks, newHooks, "Hooks Pool");
-
-    // Skip validation if nothing changed
-    if (!stateDiff && !hooksDiff) {
-      return { warnings: [], passed: true, repairRequired: false };
-    }
 
     const langInstruction = language === "en"
       ? "Respond in English."
@@ -67,40 +77,37 @@ Given the chapter text and the CHANGES made to truth files (state card + hooks p
 5. Retroactive edit — truth file change implies something happened in a PREVIOUS chapter, not the current one
 6. Cross-truth key-setting conflict — numbered rules, named laws, ranks, identities, locations, or relationship labels in the new truth files contradict the chapter text or the authority context
 
-Output format (simple, NOT JSON):
-- First line: exactly PASS, REPAIR, or FAIL (nothing else on this line)
-- Following lines: one warning per line, optionally prefixed with [category]
-- If no issues at all, just output: PASS
+Output JSON: {"verdict":"PASS|REPAIR|FAIL","issues":[{"category":"contradiction","description":"explain the problem","blocking":true,"kind":"conflict|omission|unsupported|observation","basis":"explicit|inference|ambiguous","rationale":"why these exact quotes support the issue","target":"candidate-state|candidate-hooks","evidence":[{"source":"chapter|candidate-state|candidate-hooks|baseline|authority","quote":"exact quote from that source"}]}]}.
+If no issues exist, legacy plain PASS is also accepted. Every blocking issue must include evidence. Quote full source text, not diff prefixes.
+For conflicts quote both the candidate and the chapter/baseline/authority fact. For omissions quote the explicit chapter fact and give the candidate target to check; do not invent a quote for absent text.
+Mark inferred or ambiguous interpretations as nonblocking observations, never explicit facts. If ambiguity prevents a reliable verdict, explain it for manual judgment rather than demand invented facts.
 
 Verdict semantics:
 - PASS: the truth-file projection is complete enough and consistent with the chapter.
 - REPAIR: the chapter itself is valid, but a state change or hook transition is missing, stale, or incomplete. The host will regenerate only the truth-file settlement.
 - FAIL: the proposed truth-file changes directly contradict the chapter or authority context.
 
-Example:
-PASS
-[unsupported_change] State card says character moved to the forest, but text only shows intent
-[minor] Hook H03 advanced but text mention is brief
-
-If the chapter establishes a state change that the truth files missed:
-REPAIR
-[missing_state_update] The chapter moves Lin to the harbor, but the state card still says station
-
-Or if there are hard contradictions:
-FAIL
-[contradiction] State says character is dead but chapter text shows them speaking
-[unsupported_change] New location not mentioned anywhere in chapter text
-
 IMPORTANT: Output FAIL ONLY for hard contradictions — facts that directly conflict with the chapter text. Output REPAIR for missing state updates and hook-management omissions that should be regenerated. Do NOT fail for:
 - Slightly ahead-of-text inferences
 - Reasonable extrapolations from text
-Minor details that do not affect ongoing continuity may remain warnings with PASS.`;
+Minor details that do not affect ongoing continuity may remain warnings with PASS.
+Model feedback is an opinion to verify, not new story authority. Current chapter text takes priority. Do not infer consent from noticing deception, silence, or understanding a concealed motive. Do not require a candidate to assert agreement that the chapter does not explicitly establish. Never request changes to chapter text or author settings to satisfy your interpretation.`;
 
     const authorityBlock = this.buildAuthorityContextBlock(authorityContext);
+    const sources: ValidationEvidenceSources = {
+      chapter: chapterContent,
+      "candidate-state": newState,
+      "candidate-hooks": newHooks,
+      baseline: [oldState, oldHooks].join("\n\n"),
+      authority: [authorityContext?.storyFrame ?? "", authorityContext?.bookRules ?? "", authorityContext?.chapterSummaries ?? ""].join("\n\n"),
+    };
 
     const userPrompt = `Chapter ${chapterNumber} validation:
 
 ${authorityBlock}
+
+## Full evidence sources (source labels for exact quotes)
+${JSON.stringify(sources)}
 
 ## State Card Changes
 ${stateDiff || "(no changes)"}
@@ -111,33 +118,44 @@ ${hooksDiff || "(no changes)"}
 ## Chapter Text (for reference)
 ${chapterContent}`;
 
-    try {
-      const response = await this.chat(
-        [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        { temperature: 0.1 },
-      );
-
-      try { return this.parseResult(response.content); }
-      catch (error) {
-        let diagnosticPath: string | undefined;
-        if (this.ctx.bookId) {
-          try {
-            const bookDir = safeChildPath(join(this.ctx.projectRoot, "books"), this.ctx.bookId);
-            const directory = join(bookDir, "story", "recovery", "validator");
-            const path = join(directory, `${chapterNumber}-${randomUUID()}.json`);
-            await mkdir(directory, { recursive: true });
-            await writeFile(path, JSON.stringify({ chapterNumber, model: this.ctx.model, response: response.content, recordedAt: new Date().toISOString() }), "utf8");
-            diagnosticPath = path;
-          } catch (saveError) { this.log?.warn(`Validator diagnostic could not be saved: ${String(saveError)}`); }
+    const messages: LLMMessage[] = [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }];
+    for (const attempt of [1, 2] as const) {
+      const common = { attempt, chapterNumber, model: this.ctx.model };
+      const preparedMessages = await this.appendTaskSkillGuidance([...messages]);
+      await this.recordDiagnostic({ ...common, phase: "request", messages: preparedMessages }, options);
+      const response = await this.chat(preparedMessages, { temperature: 0.1 }, { alreadyPrepared: true });
+      const diagnosticPath = await this.recordDiagnostic({ ...common, phase: "response", response: response.content }, options);
+      try {
+        const result = this.parseResult(response.content);
+        if (!result.issues && result.warnings.some((warning) => ["unsupported_change", "contradiction", "missing_state_update", "hook_anomaly", "temporal_impossibility", "retroactive_edit"].includes(warning.category))) {
+          throw Object.assign(new Error("Legacy continuity warning requires grounded evidence and a consistent verdict."), { reasonCode: "VALIDATOR_EVIDENCE_INVALID" });
         }
-        throw Object.assign(new Error(String(error), { cause: error }), { reasonCode: "VALIDATOR_PROTOCOL_INVALID", diagnosticPath });
+        if (!result.passed && !result.issues?.some((issue) => issue.blocking)) {
+          throw Object.assign(new Error("Blocking verdict requires structured grounded evidence."), { reasonCode: "VALIDATOR_EVIDENCE_INVALID" });
+        }
+        if (result.issues) checkValidationEvidence(result.issues, sources);
+        return result;
+      } catch (error) {
+        const reasonCode = (error as { reasonCode?: string }).reasonCode ?? "VALIDATOR_PROTOCOL_INVALID";
+        if (attempt === 2) throw Object.assign(new Error(String(error), { cause: error }), { reasonCode, diagnosticPath });
+        messages.push({ role: "assistant", content: response.content });
+        messages.push({ role: "user", content: `Correct only your validation protocol/evidence against the SAME candidate and sources. ${reasonCode}: ${String(error)}. Return the required structured verdict with exact source quotes. Reassess unsupported interpretations; do not invent facts, change the chapter, or edit the candidate. Do not infer consent from noticing deception or silence. This is the only correction attempt.` });
       }
-    } catch (error) {
-      this.log?.warn(`State validation failed: ${error}`);
-      throw error;
+    }
+    throw new Error("Validator correction budget exhausted");
+  }
+
+  private async recordDiagnostic(event: StateValidationDiagnostic, options?: StateValidationOptions): Promise<string | undefined> {
+    if (options?.onDiagnostic) { await options.onDiagnostic(event); return undefined; }
+    if (!this.ctx.bookId) return undefined;
+    try {
+      const directory = join(safeChildPath(join(this.ctx.projectRoot, "books"), this.ctx.bookId), "story", "recovery", "validator");
+      const path = join(directory, `${event.chapterNumber}-${event.attempt}-${event.phase}-${randomUUID()}.json`);
+      await mkdir(directory, { recursive: true });
+      await writeFile(path, JSON.stringify({ ...event, recordedAt: new Date().toISOString() }), { encoding: "utf8", flag: "wx" });
+      return path;
+    } catch (cause) {
+      throw Object.assign(new Error("Validator evidence could not be saved", { cause }), { reasonCode: "SETTLEMENT_EVIDENCE_WRITE_FAILED" });
     }
   }
 
@@ -206,7 +224,7 @@ ${chapterContent}`;
     const warnings: ValidationWarning[] = [];
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i]!;
-      if (/^(PASS|REPAIR|FAIL)$/i.test(line)) continue;
+      if (/^(PASS|REPAIR|FAIL)$/i.test(line)) throw new Error("State validator returned multiple verdicts");
 
       const categoryMatch = line.match(/^\[([^\]]+)\]\s*(.+)$/);
       if (categoryMatch) {
@@ -244,15 +262,27 @@ ${chapterContent}`;
   }
 
   private tryParseExactJsonResult(text: string): ValidationResult | null {
+    let parsed: any;
     try {
-      const parsed = JSON.parse(text) as {
-        warnings?: Array<{ category?: string; description?: string }>;
-        passed?: boolean;
-        repairRequired?: boolean;
-      };
+      parsed = JSON.parse(text);
+    } catch { return null; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if ("verdict" in parsed || "issues" in parsed) {
+      if (!["PASS", "REPAIR", "FAIL"].includes(parsed.verdict) || !Array.isArray(parsed.issues)) throw new Error("State validator returned invalid structured verdict");
+      if (["warnings", "passed", "repairRequired"].some((field) => field in parsed)) throw new Error("State validator mixed structured and legacy verdict fields");
+      const issues = groundedValidationIssueSchema.array().safeParse(parsed.issues);
+      if (!issues.success) throw Object.assign(new Error("State validator returned invalid evidence structure"), { reasonCode: "VALIDATOR_EVIDENCE_INVALID" });
+      if (parsed.verdict === "PASS" && issues.data.some((issue) => issue.blocking)) throw new Error("PASS cannot contain blocking issues");
+      return { passed: parsed.verdict === "PASS", repairRequired: parsed.verdict === "REPAIR", issues: issues.data,
+        warnings: issues.data.map(({ category, description }) => ({ category, description })) };
+    }
+    try {
       if (typeof parsed.passed !== "boolean") return null;
+      if (parsed.repairRequired !== undefined && typeof parsed.repairRequired !== "boolean") return null;
+      if (parsed.passed && parsed.repairRequired) return null;
+      if (parsed.warnings !== undefined && (!Array.isArray(parsed.warnings) || parsed.warnings.some((w: any) => !w || typeof w.category !== "string" || typeof w.description !== "string"))) return null;
       return {
-        warnings: (parsed.warnings ?? []).map((w) => ({
+        warnings: (parsed.warnings ?? []).map((w: ValidationWarning) => ({
           category: w.category ?? "unknown",
           description: w.description ?? "",
         })),
@@ -269,6 +299,10 @@ function extractBalancedJsonObject(text: string): string | null {
   const start = text.indexOf("{");
   if (start < 0) {
     return null;
+  }
+  const prefix = text.slice(0, start).trim();
+  if (prefix && !/^```(?:json)?$/i.test(prefix)) {
+    throw new Error("State validator returned content before its JSON verdict");
   }
 
   let depth = 0;
@@ -317,6 +351,16 @@ function extractBalancedJsonObject(text: string): string | null {
   }
 
   if (endIndex < 0) return null;
+
+  const suffix = text.slice(endIndex + 1).trim();
+  // Preserve harmless historical markdown notes, but never choose the first
+  // verdict when another object or verdict token follows it.
+  if (suffix.includes("{") || /\b(?:PASS|REPAIR|FAIL)\b/i.test(suffix)) {
+    throw new Error("State validator returned competing verdict content");
+  }
+  if (prefix && suffix !== "```") {
+    throw new Error("State validator returned an invalid JSON fence");
+  }
 
   // Only accept the candidate if what follows the closing brace is
   // nothing, whitespace, or a structural JSON terminator.

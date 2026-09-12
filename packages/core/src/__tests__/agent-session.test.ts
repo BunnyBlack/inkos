@@ -1489,6 +1489,8 @@ describe("runAgentSession cache — bookId switch", () => {
       "recover_transaction",
       "recover_chapters",
       "resume_revision_candidate",
+      "inspect_settlement_attempt",
+      "resume_settlement_attempt",
       "generate_cover",
       "read",
       "write_truth_file",
@@ -1531,8 +1533,11 @@ describe("runAgentSession cache — bookId switch", () => {
       { sessionId: "suppress-session", bookId: "book-a", language: "zh", pipeline, projectRoot, model, suppressProductionTools: true },
       "任务在跑吗？",
     );
+    expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).not.toContain("resume_settlement_attempt");
+    expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toContain("inspect_settlement_attempt");
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
       "recovery_status",
+      "inspect_settlement_attempt",
       "read",
       "research_web",
       "ingest_material",
@@ -1558,6 +1563,8 @@ describe("runAgentSession cache — bookId switch", () => {
       "recover_transaction",
       "recover_chapters",
       "resume_revision_candidate",
+      "inspect_settlement_attempt",
+      "resume_settlement_attempt",
       "generate_cover",
       "read",
       "write_truth_file",
@@ -1594,6 +1601,8 @@ describe("runAgentSession cache — bookId switch", () => {
       "recover_transaction",
       "recover_chapters",
       "resume_revision_candidate",
+      "inspect_settlement_attempt",
+      "resume_settlement_attempt",
       "read",
       "write_truth_file",
       "rename_entity",

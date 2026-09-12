@@ -48,8 +48,8 @@ async function treeFiles(root: string, controls = false): Promise<Array<[string,
 }
 
 /** Capture exact published bytes (including heading) and all retained baseline files. */
-export async function captureCandidateInputs(bookDir: string, chapter: number, effectiveInstructions?: string): Promise<CandidateInputs> {
-  const source = (await readRecoveryBody(bookDir, chapter)).bytes;
+export async function captureCandidateInputs(bookDir: string, chapter: number, effectiveInstructions?: string, unpublishedBody?: Buffer): Promise<CandidateInputs> {
+  const source = unpublishedBody ?? (await readRecoveryBody(bookDir, chapter)).bytes;
   const baseline = await treeFiles(join(bookDir, "story", "snapshots", String(chapter - 1)));
   const controls = await treeFiles(join(bookDir, "story"), true);
   const bookConfig = await optionalRead(join(bookDir, "book.json"));

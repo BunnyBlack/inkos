@@ -10,6 +10,10 @@ import {
   inspectBookHealth,
   findRecoveryBaseline,
   listRecoveryCandidates,
+  listSettlementAttempts,
+  loadSettlementAttempt,
+  readSettlementEvents,
+  readBookConsistently,
   discardRecoveryCandidate,
   planBookRecovery,
   createLLMClient,
@@ -3440,8 +3444,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     try {
       const health = await inspectBookHealth(state.bookDir(c.req.param("id")));
       const candidates = await listRecoveryCandidates(state.bookDir(c.req.param("id")));
+      const settlementAttempts = await listSettlementAttempts(state.bookDir(c.req.param("id")));
       const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(state.bookDir(c.req.param("id")));
-      return c.json({ health, candidates, availableBaselineBackup, ...(target === undefined ? {} : { plan: planBookRecovery(health, Number(target)) }) });
+      return c.json({ health, candidates, settlementAttempts, availableBaselineBackup, ...(target === undefined ? {} : { plan: planBookRecovery(health, Number(target)) }) });
     } catch (error) { return c.json({ error: String(error) }, 500); }
   });
 
@@ -3504,6 +3509,40 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     } catch (error) {
       const reasonCode = (error as { code?: string }).code;
       return c.json({ status: "failed", candidateId, reasonCode, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : 500);
+    }
+  });
+
+  app.get("/api/v1/books/:id/settlements/:attemptId", async (c) => {
+    const attemptId = c.req.param("attemptId");
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(attemptId)) return c.json({ reasonCode: "INVALID_SETTLEMENT_ATTEMPT_ID" }, 400);
+    try {
+      const bookDir = state.bookDir(c.req.param("id"));
+      return c.json(await readBookConsistently(bookDir, async () => ({ attempt: await loadSettlementAttempt(bookDir, attemptId), events: await readSettlementEvents(bookDir, attemptId) })));
+    } catch (error) {
+      const failure = error as { code?: string; reasonCode?: string };
+      return c.json({ status: "failed", attemptId, reasonCode: failure.reasonCode ?? failure.code, error: String(error) }, failure.code === "ENOENT" ? 404 : 409);
+    }
+  });
+
+  app.post("/api/v1/books/:id/settlements/:attemptId/resume", async (c) => {
+    const id = c.req.param("id");
+    const attemptId = c.req.param("attemptId");
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(attemptId)) return c.json({ reasonCode: "INVALID_SETTLEMENT_ATTEMPT_ID" }, 400);
+    let action: "revalidate" | "repair";
+    try {
+      const body = await c.req.json();
+      if (!body || (body.action !== "revalidate" && body.action !== "repair")) throw new Error("Invalid action");
+      action = body.action;
+    } catch { return c.json({ reasonCode: "INVALID_SETTLEMENT_ACTION" }, 400); }
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig({ bookIdForSettings: id }));
+      const result = await pipeline.runWithAbortSignal(c.req.raw.signal, () => pipeline.resumeSettlementAttempt(id, attemptId, action));
+      broadcast("recovery:settlement-result", { bookId: id, ...result });
+      return c.json(result, result.status === "applied" || result.status === "unchanged" ? 200 : 422);
+    } catch (error) {
+      const failure = error as { code?: string; reasonCode?: string; stage?: string; name?: string };
+      const reasonCode = failure.reasonCode ?? failure.code;
+      return c.json({ status: failure.name === "AbortError" ? "cancelled" : "failed", attemptId, reasonCode, stage: failure.stage, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : 422);
     }
   });
 

@@ -72,6 +72,18 @@ it("counts unapplied revisions with reworded instructions despite successful can
   expect(() => guard.beforeModelCall()).toThrow(/loop guard.*2/i);
 });
 
+it("counts recovery and settlement resume against the actual failed chapter", () => {
+  const guard = new SessionLoopGuard();
+  for (const [i, name] of ["recover_chapters", "resume_settlement_attempt"].entries()) {
+    guard.observe({ type: "tool_execution_start", toolCallId: String(i), toolName: name, args: { bookId: "sample", targetChapter: i + 2 } } as any);
+    guard.observe({ type: "tool_execution_end", toolCallId: String(i), toolName: name, isError: false,
+      result: { details: { status: "failed", bookId: "sample", chapterNumber: i + 2, failedChapter: 1, stage: "validation", attemptId: `attempt-${i}` } } } as any);
+  }
+  expect(() => guard.beforeModelCall()).toThrow(/loop guard/);
+  guard.reset();
+  expect(() => guard.beforeModelCall()).not.toThrow();
+});
+
 it.each([
   [{ applied: false, status: "unchanged" }, true],
   [{ applied: true, auditPassed: false }, false],

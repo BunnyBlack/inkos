@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { requestBookRecovery, recoveryChapterTargets, type RecoveryView } from "../lib/book-recovery-api";
+import { requestBookRecovery, recoveryChapterTargets, mergeRecoveryResult, type RecoveryView } from "../lib/book-recovery-api";
+
+export function SettlementDiagnostics({ view }: { view: RecoveryView }) {
+  if (!view.attempt && !view.events) return null;
+  return <pre className="text-xs whitespace-pre-wrap break-words max-h-96 overflow-auto" aria-label="Settlement evidence">{JSON.stringify({ attempt: view.attempt, events: view.events }, null, 2)}</pre>;
+}
 
 export function BookRecoveryPanel({ bookId, chapters, language, candidate, busy, onChanged, initialInspect }: {
   bookId: string; chapters: readonly number[]; language?: string; candidate?: string; busy?: boolean; onChanged: () => void; initialInspect?: boolean;
@@ -7,6 +12,8 @@ export function BookRecoveryPanel({ bookId, chapters, language, candidate, busy,
   const en = language === "en";
   const [target, setTarget] = useState(chapters.at(-1) ?? 1);
   const [candidateId, setCandidateId] = useState(candidate ?? "");
+  const [attemptId, setAttemptId] = useState("");
+  const [evidence, setEvidence] = useState<RecoveryView>({});
   const [legacyGate, setLegacyGate] = useState("");
   const [view, setView] = useState<RecoveryView | null>(null);
   const [pending, setPending] = useState(false);
@@ -24,6 +31,7 @@ export function BookRecoveryPanel({ bookId, chapters, language, candidate, busy,
   const selectedTarget = targetChapters.includes(target) ? target : targetChapters.at(-1) ?? 1;
   const liveOwner = view?.health?.issues.some(issue => issue.code === "BOOK_BUSY");
   const selectedCandidate = view?.candidates?.find(entry => entry.candidateId === candidateId.trim());
+  const selectedAttempt = view?.settlementAttempts?.find(entry => entry.attemptId === attemptId);
   const needsLegacyPolicy = selectedCandidate?.policySource === "missing" || (view?.reasonCode === "CANDIDATE_POLICY_REQUIRED" && view.candidateId === candidateId.trim());
   const reasonLabels: Record<string, string> = {
     BASELINE_MISSING: en ? "A verified initial state or backup is required." : "需要可验证的初始状态或备份。",
@@ -44,10 +52,11 @@ export function BookRecoveryPanel({ bookId, chapters, language, candidate, busy,
     setPending(true); setError("");
     try {
       const result = await requestBookRecovery(path, body);
+      if (result.attempt) { setEvidence(result); return; }
       const isMutation = body && !(body as { dryRun?: boolean }).dryRun;
       let latest: RecoveryView = {};
       if (isMutation) latest = await requestBookRecovery(`${base}/recovery-status`).catch(() => ({}));
-      setView({ ...result, ...latest });
+      setView(current => mergeRecoveryResult(current, latest, result));
       if (result.reasonCode !== "CANDIDATE_POLICY_REQUIRED") setLegacyGate("");
       if (result.candidateId) setCandidateId(result.candidateId);
       if (isMutation && (result.status === "applied" || result.status === "unchanged" || result.applied || result.completed?.length)) onChanged();
@@ -81,6 +90,18 @@ export function BookRecoveryPanel({ bookId, chapters, language, candidate, busy,
     {view?.health?.issues.length ? <p className="text-xs text-amber-600">{[...new Set(view.health.issues.map(issue => reasonLabels[issue.code] ?? issue.code))].join(" · ")}</p> : null}
     {status && <p role="status" className="text-xs">{status}{view?.completed?.length ? ` (${view.completed.join(", ")})` : ""}</p>}
     {(error || view?.error || reason) && <p role="alert" className="text-xs text-destructive">{error || view?.error || (reason && (reasonLabels[reason] ?? reason))}</p>}
+    {view?.stage && <p className="text-xs">{en ? "Stage" : "阶段"}: {view.stage}</p>}
+    {view?.issues?.length ? <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(view.issues, null, 2)}</pre> : null}
+    <div className="space-y-2">
+      <label className="text-xs">{en ? "Settlement attempts" : "状态结算尝试"}<select aria-label={en ? "Settlement attempts" : "状态结算尝试"} className="ml-2 p-2 border rounded bg-background" value={attemptId} onChange={event => { setAttemptId(event.target.value); setEvidence({}); }}>
+        <option value="">{en ? "Select attempt" : "选择结算尝试"}</option>
+        {view?.settlementAttempts?.map(entry => <option key={entry.attemptId} value={entry.attemptId}>{entry.chapter}: {entry.status} · {entry.attemptId}</option>)}
+      </select></label>
+      <button className={button} disabled={pending || !attemptId} onClick={() => void request(`${base}/settlements/${encodeURIComponent(attemptId)}`)}>{en ? "Inspect settlement evidence" : "查看结算证据"}</button>
+      {(["revalidate", "repair"] as const).map(action => <button key={action} className={button} disabled={pending || busy || liveOwner || !selectedAttempt?.resumable || selectedAttempt.status === "applied" || selectedAttempt.status === "discarded"} onClick={() => void request(`${base}/settlements/${encodeURIComponent(attemptId)}/resume`, { action })}>{action === "revalidate" ? (en ? "Revalidate candidate" : "重新校验候选") : (en ? "Repair candidate" : "修复候选")}</button>)}
+      <p className="text-xs text-muted-foreground">{en ? "Verify feedback against the chapter. Unsupported feedback does not justify changing character settings." : "请对照正文核实反馈；无依据的校验意见不能作为修改角色设定的理由。"}</p>
+      <SettlementDiagnostics view={evidence} />
+    </div>
     <div className="flex flex-wrap gap-2 items-center">
       {view?.candidates?.some(entry => entry.status === "pending") && <label className="text-xs">{en ? "Available candidates" : "可重试候选"}<select aria-label={en ? "Available candidates" : "可重试候选"} className="ml-2 p-2 border rounded bg-background" value={view.candidates.some(entry => entry.candidateId === candidateId) ? candidateId : ""} onChange={event => { setCandidateId(event.target.value); setLegacyGate(""); }}>
         <option value="">{en ? "Select candidate" : "选择候选"}</option>

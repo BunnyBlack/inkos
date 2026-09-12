@@ -91,13 +91,13 @@ export class SessionLoopGuard {
       const outcome = details?.outcome;
       const key = fingerprint([
         details?.bookId ?? productionArgs.bookId ?? "active",
-        details?.chapterNumber ?? productionArgs.chapterNumber ?? "latest",
+        details?.failedChapter ?? details?.chapterNumber ?? productionArgs.chapterNumber ?? "latest",
         details?.sourceRevision ?? outcome?.sourceRevision ?? "unchanged",
         "chapter-production", outcome?.stage ?? details?.stage ?? "production",
       ]);
       this.productionFailures.set(key, {
         count: (this.productionFailures.get(key)?.count ?? 0) + 1,
-        candidateId: outcome?.candidateId ?? details?.candidateId,
+        candidateId: details?.attemptId ?? outcome?.candidateId ?? details?.candidateId,
       });
       this.reads.delete(signature);
       return;

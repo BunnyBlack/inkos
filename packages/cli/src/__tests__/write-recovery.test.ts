@@ -7,7 +7,7 @@ const fixture = vi.hoisted(() => ({ root: "" }));
 const mocks = vi.hoisted(() => ({ log: vi.fn(), error: vi.fn(), config: vi.fn(), recover: vi.fn(), resume: vi.fn(), discard: vi.fn() }));
 vi.mock("@actalk/inkos-core", async (original) => ({
   ...await original<typeof import("@actalk/inkos-core")>(),
-  PipelineRunner: class { recoverChapters = mocks.recover; resumeRevisionCandidate = mocks.resume; },
+  PipelineRunner: class { recoverChapters = mocks.recover; resumeRevisionCandidate = mocks.resume; resumeSettlementAttempt = mocks.resume; },
   discardRecoveryCandidate: mocks.discard,
 }));
 vi.mock("../utils.js", async (original) => ({
@@ -21,6 +21,13 @@ vi.mock("../utils.js", async (original) => ({
 }));
 
 describe("write recovery commands", () => {
+  it("resumes a settlement with explicit action and reports failure details", async () => {
+    mocks.resume.mockResolvedValue({ status: "failed", attemptId: "attempt-one", reasonCode: "SETTLEMENT_NO_PROGRESS", issues: ["Unproven consent"] });
+    await run("resume-settlement", "fixture", "attempt-one", "--action", "revalidate", "--json");
+    expect(mocks.resume).toHaveBeenCalledWith("fixture", "attempt-one", "revalidate");
+    expect(JSON.parse(mocks.log.mock.calls.at(-1)![0])).toMatchObject({ reasonCode: "SETTLEMENT_NO_PROGRESS", issues: ["Unproven consent"] });
+    expect(process.exitCode).toBe(1);
+  });
   beforeEach(async () => {
     vi.clearAllMocks();
     process.exitCode = 0;

@@ -34,8 +34,9 @@ export abstract class BaseAgent {
   protected async chat(
     messages: ReadonlyArray<LLMMessage>,
     options?: { readonly temperature?: number; readonly maxTokens?: number },
+    preparation?: { readonly alreadyPrepared: true },
   ): Promise<LLMResponse> {
-    return runWorkerAgent(this.ctx.client, this.ctx.model, await this.appendTaskSkillGuidance(messages), {
+    return runWorkerAgent(this.ctx.client, this.ctx.model, preparation?.alreadyPrepared ? messages : await this.appendTaskSkillGuidance(messages), {
       ...options,
       onStreamProgress: this.ctx.onStreamProgress,
       signal: this.ctx.signal,
@@ -66,7 +67,8 @@ export abstract class BaseAgent {
     });
   }
 
-  private async appendTaskSkillGuidance(
+  /** Prepare once before persisting a request, then use chat's alreadyPrepared option. */
+  protected async appendTaskSkillGuidance(
     messages: ReadonlyArray<LLMMessage>,
   ): Promise<ReadonlyArray<LLMMessage>> {
     const query = messages

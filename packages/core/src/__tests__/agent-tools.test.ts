@@ -7,6 +7,8 @@ import { ArchitectIncompleteFoundationError } from "../agents/architect.js";
 import {
   createReadTool,
   createRecoveryStatusTool,
+  createInspectSettlementAttemptTool,
+  createResumeSettlementAttemptTool,
   createRecoverChaptersTool,
   createResumeRevisionCandidateTool,
   createGenerateCoverTool,
@@ -47,6 +49,17 @@ function contextPipeline<T extends object>(pipeline: T): T & {
 }
 
 describe("agent deterministic writing tools", () => {
+  it("exposes settlement evidence and preserves bounded resume failure details", async () => {
+    const pipeline = contextPipeline({
+      inspectSettlementAttempt: vi.fn(async () => ({ attempt: { attemptId: "attempt-one" }, events: [{ type: "validation-response" }] })),
+      resumeSettlementAttempt: vi.fn(async () => ({ status: "failed", attemptId: "attempt-one", chapterNumber: 1, reasonCode: "SETTLEMENT_NO_PROGRESS", issues: ["Unproven consent"], nextActions: ["inspect"] })),
+    });
+    const inspected = await createInspectSettlementAttemptTool(pipeline as any, "harbor").execute("i", { attemptId: "attempt-one" });
+    expect(inspected.details).toMatchObject({ attempt: { attemptId: "attempt-one" }, events: [{ type: "validation-response" }] });
+    const result = await createResumeSettlementAttemptTool(pipeline as any, "harbor").execute("r", { attemptId: "attempt-one", action: "revalidate" });
+    expect(pipeline.resumeSettlementAttempt).toHaveBeenCalledWith("harbor", "attempt-one", "revalidate");
+    expect(result.details).toMatchObject({ status: "failed", attemptId: "attempt-one", chapterNumber: 1, issues: ["Unproven consent"] });
+  });
   let root: string;
   let state: StateManager;
 

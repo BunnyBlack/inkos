@@ -1,8 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readRecoveryBody } from "../state/recovery-index.js";
-import { afterBookCommit } from "../state/book-transaction.js";
+import { afterBookCommit, readBookConsistently } from "../state/book-transaction.js";
 import { inspectBookHealth } from "../state/book-health.js";
 import { planBookRecovery, type RecoveryPlan } from "./book-recovery.js";
+import { captureCandidateInputs } from "./recovery-candidate.js";
+import { loadSettlementAttempt, listSettlementAttempts, readSettlementEvents, markSettlementApplied, appendSettlementEvent } from "./settlement-attempt.js";
+import { captureSettlementRecording, validateRecordedSettlement, settlementFailure, buildStateValidationFeedback, settlementMadeNoProgress } from "./chapter-state-recovery.js";
 import type { LLMClient, OnStreamProgress } from "../llm/provider.js";
 import { createLLMClient } from "../llm/provider.js";
 import { runWorkerAgent } from "../agent/worker-agent.js";
@@ -1560,15 +1563,15 @@ export class PipelineRunner {
         ruleStack: reviseControlInput?.composed.ruleStack,
       });
       candidateStage = "validation";
-      let stateValidation = await stateValidator.validate(
-        revisedContent,
-        targetChapter,
-        baselineState,
-        settledRevision.updatedState,
-        baselineHooks,
-        settledRevision.updatedHooks,
-        language,
-      );
+      const revisionRecording = await captureSettlementRecording(bookDir, targetChapter, revisedContent, {
+        baselineChapter, chapterIntent: reviseControlInput?.plan.intentMarkdown,
+        contextPackage: reviseControlInput?.composed.contextPackage, ruleStack: reviseControlInput?.composed.ruleStack,
+      });
+      const revisionValidation = await validateRecordedSettlement({ validator: stateValidator, bookDir,
+        chapterNumber: targetChapter, content: revisedContent, output: settledRevision,
+        oldState: baselineState, oldHooks: baselineHooks, language, recording: revisionRecording });
+      let revisionAttemptId = revisionValidation.attempt.attemptId;
+      let stateValidation = revisionValidation.validation;
       if (!stateValidation.passed || stateValidation.repairRequired) {
         const recovery = await retrySettlementAfterValidationFailure({
           writer,
@@ -1589,11 +1592,12 @@ export class PipelineRunner {
           oldState: baselineState,
           oldHooks: baselineHooks,
           originalValidation: stateValidation,
+          previousSettlement: settledRevision, recording: revisionRecording, parentAttemptId: revisionAttemptId,
           language,
           logger: this.config.logger,
         });
         if (recovery.kind === "degraded") {
-          await recordCandidateAttempt(bookDir, candidate.candidateId, "validation-rejected", { attempts: 2, issues: recovery.issues });
+          await recordCandidateAttempt(bookDir, candidate.candidateId, "validation-rejected", { attempts: 2, issues: recovery.issues, settlementAttemptId: recovery.attemptId });
           return {
             candidateId: candidate.candidateId,
             chapterNumber: targetChapter,
@@ -1622,6 +1626,7 @@ export class PipelineRunner {
         }
         settledRevision = recovery.output;
         stateValidation = recovery.validation;
+        revisionAttemptId = recovery.attemptId ?? revisionAttemptId;
       }
       candidateStage = "audit";
       const postRevision = await this.evaluateMergedAudit({
@@ -1795,6 +1800,7 @@ export class PipelineRunner {
         en: `updating chapter index and snapshots for chapter ${targetChapter}`,
       });
       await this.state.snapshotState(bookId, targetChapter);
+      await markSettlementApplied(bookDir, revisionAttemptId);
       await this.syncNarrativeMemoryIndex(bookId);
       if (isLatestChapter) {
         await this.syncCurrentStateFactHistory(bookId, targetChapter);
@@ -1833,6 +1839,7 @@ export class PipelineRunner {
       }).catch(recordError => this.config.logger?.warn(`Candidate failure evidence could not be saved: ${String(recordError)}`));
       throw Object.assign(new Error(`${original.message} Candidate preserved: ${retainedCandidateId}; retry with resume-candidate.`, { cause: original }), {
         name: original.name, candidateId: retainedCandidateId, chapterNumber: retainedChapterNumber, reasonCode, stage: candidateStage,
+        attemptId: (original as { attemptId?: string }).attemptId,
       });
     } finally {
       await releaseLock();
@@ -1963,13 +1970,23 @@ export class PipelineRunner {
     const health = await inspectBookHealth(this.state.bookDir(bookId));
     const candidates = await listRecoveryCandidates(this.state.bookDir(bookId));
     const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(this.state.bookDir(bookId));
-    return { health, candidates, availableBaselineBackup, plan: targetChapter === undefined ? undefined : planBookRecovery(health, targetChapter) };
+    const settlementAttempts = await listSettlementAttempts(this.state.bookDir(bookId));
+    return { health, candidates, settlementAttempts, availableBaselineBackup, plan: targetChapter === undefined ? undefined : planBookRecovery(health, targetChapter) };
+  }
+
+  async inspectSettlementAttempt(bookId: string, attemptId: string) {
+    const bookDir = this.state.bookDir(bookId);
+    return readBookConsistently(bookDir, async () => ({
+      attempt: await loadSettlementAttempt(bookDir, attemptId),
+      events: await readSettlementEvents(bookDir, attemptId),
+    }));
   }
 
   /** Explicit ordered recovery preserves every body and commits each chapter separately. */
   async recoverChapters(bookId: string, targetChapter: number): Promise<{
     status: "applied" | "unchanged" | "failed" | "blocked" | "cancelled";
     completed: number[]; plan: RecoveryPlan; reasonCode?: string; error?: string; failedChapter?: number; addedChapters?: number[];
+    attemptId?: string; stage?: string; issues?: unknown; nextActions?: string[];
   }> {
     if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.recoverChapters(bookId, targetChapter));
     const release = await this.state.acquireBookLock(bookId);
@@ -1996,10 +2013,46 @@ export class PipelineRunner {
           completed.push(step.chapter);
         } catch (error) {
           return { status: this.currentAbortSignal()?.aborted ? "cancelled" as const : "failed" as const,
-            reasonCode: "CHAPTER_RECOVERY_FAILED", error: String(error), failedChapter: step.chapter, completed, plan, addedChapters };
+            ...settlementFailure(error), error: String(error), failedChapter: step.chapter, completed, plan, addedChapters };
         }
       }
       return { status: completed.length ? "applied" as const : "unchanged" as const, completed, plan, addedChapters };
+    } finally { await release(); }
+  }
+
+  async resumeSettlementAttempt(bookId: string, attemptId: string, action: "revalidate" | "repair"): Promise<{
+    status: "applied" | "unchanged" | "failed" | "cancelled"; attemptId?: string; chapterNumber?: number;
+    reasonCode?: string; stage?: string; error?: string; issues?: unknown; nextActions?: string[]; failedChapter?: number;
+  }> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.resumeSettlementAttempt(bookId, attemptId, action));
+    const release = await this.state.acquireBookLock(bookId);
+    let failedChapter: number | undefined;
+    try {
+      if (action !== "revalidate" && action !== "repair") throw new Error("INVALID_SETTLEMENT_ACTION");
+      const bookDir = this.state.bookDir(bookId);
+      const attempt = await loadSettlementAttempt(bookDir, attemptId);
+      failedChapter = attempt.chapter;
+      const health = await inspectBookHealth(bookDir);
+      if (health.pendingOperationId || health.issues.some(issue => issue.code === "TRANSACTION_RECOVERY_REQUIRED" || issue.code === "BOOK_BUSY")) {
+        throw Object.assign(new Error("TRANSACTION_RECOVERY_REQUIRED"), { reasonCode: "TRANSACTION_RECOVERY_REQUIRED", stage: "preflight" });
+      }
+      if (attempt.status === "applied") {
+        const current = await captureCandidateInputs(bookDir, attempt.chapter, attempt.context.settlementGuidance);
+        if (current.sourceHash !== attempt.inputs.sourceHash || current.baselineHash !== attempt.inputs.baselineHash
+          || current.controlHash !== attempt.inputs.controlHash || (health.stateFrontier ?? -1) < attempt.chapter) {
+          throw Object.assign(new Error("SETTLEMENT_SUPERSEDED: applied attempt no longer describes the current book."), { reasonCode: "SETTLEMENT_SUPERSEDED", stage: "preflight" });
+        }
+        return { status: "unchanged" as const, attemptId, chapterNumber: attempt.chapter };
+      }
+      if (health.stateFrontier !== null && health.stateFrontier >= attempt.chapter) {
+        throw Object.assign(new Error("SETTLEMENT_SUPERSEDED: chapter state has already been verified."), { reasonCode: "SETTLEMENT_SUPERSEDED", stage: "preflight" });
+      }
+      if (!attempt.resumable || attempt.status === "discarded") throw Object.assign(new Error("SETTLEMENT_NOT_RESUMABLE"), { reasonCode: "SETTLEMENT_NOT_RESUMABLE" });
+      const result = await this._resyncChapterArtifactsLocked(bookId, attempt.chapter, { resumeAttemptId: attemptId, resumeAction: action });
+      return { ...result, status: "applied" as const, attemptId };
+    } catch (error) {
+      return { status: this.currentAbortSignal()?.aborted ? "cancelled" as const : "failed" as const,
+        ...settlementFailure(error), failedChapter, attemptId: (error as { attemptId?: string }).attemptId ?? attemptId, error: String(error) };
     } finally { await release(); }
   }
 
@@ -2393,6 +2446,7 @@ export class PipelineRunner {
     ]);
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
     const truthValidation = await validateChapterTruthPersistence({
+      recordAttempts: true,
       writer,
       validator,
       book,
@@ -2469,7 +2523,7 @@ export class PipelineRunner {
       degradedIssues,
       tokenUsage: totalUsage,
       loadChapterIndex: () => this.state.loadChapterIndex(bookId),
-      saveChapter: () => writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang),
+      saveChapter: () => writer.saveChapter(bookDir, persistenceOutput, gp.numericalSystem, pipelineLang, { preserveTruth: resolvedStatus === "state-degraded" }),
       saveTruthFiles: async () => {
         await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, persistenceOutput);
         this.logStage(stageLanguage, { zh: "同步记忆索引", en: "syncing memory indexes" });
@@ -2483,7 +2537,10 @@ export class PipelineRunner {
         issues,
         language: stageLanguage,
       }).catch(() => undefined),
-      snapshotState: () => this.state.snapshotState(bookId, chapterNumber),
+      snapshotState: async () => {
+        await this.state.snapshotState(bookId, chapterNumber);
+        if (truthValidation.attemptId) await markSettlementApplied(bookDir, truthValidation.attemptId);
+      },
       syncCurrentStateFactHistory: () => this.syncCurrentStateFactHistory(bookId, chapterNumber),
       logSnapshotStage: () =>
         this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
@@ -2535,147 +2592,19 @@ export class PipelineRunner {
   }
 
   private async _repairChapterStateLocked(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
-    const book = await this.state.loadBookConfig(bookId);
-    const bookDir = this.state.bookDir(bookId);
-    const stageLanguage = await this.resolveBookLanguage(book);
-    const index = [...(await this.state.loadChapterIndex(bookId))];
-    if (index.length === 0) {
-      throw new Error(`Book "${bookId}" has no persisted chapters to repair.`);
-    }
-
-    const targetChapter = chapterNumber ?? index[index.length - 1]!.number;
-    const targetIndex = index.findIndex((chapter) => chapter.number === targetChapter);
-    if (targetIndex < 0) {
-      throw new Error(`Chapter ${targetChapter} not found in "${bookId}".`);
-    }
-    const targetMeta = index[targetIndex]!;
-    const latestChapter = Math.max(...index.map((chapter) => chapter.number));
-    if (!isChapterStateDegraded(targetMeta)) {
-      throw new Error(`Chapter ${targetChapter} is not state-degraded.`);
-    }
-    await this.assertNoPendingStateRepair(bookId, targetChapter);
-
-    this.logStage(stageLanguage, { zh: "修复章节状态结算", en: "repairing chapter state settlement" });
-    const { profile: gp } = await this.loadGenreProfile(book.genre);
-    const pipelineLang = book.language ?? gp.language;
-    const content = await this.readChapterContent(bookDir, targetChapter);
-    const baselineChapter = targetChapter - 1;
-    const baselineStoryDir = join(bookDir, "story", "snapshots", String(baselineChapter));
-    const [oldState, oldHooks] = await Promise.all([
-      readFile(join(baselineStoryDir, "current_state.md"), "utf-8"),
-      readFile(join(baselineStoryDir, "pending_hooks.md"), "utf-8"),
-    ]).catch((error) => {
-      throw new Error(
-        `Cannot repair chapter ${targetChapter} safely: baseline snapshot ${baselineChapter} is unavailable (${String(error)})`,
-      );
-    });
-
-    const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
-    let repairedOutput = await writer.settleChapterState({
-      book,
-      bookDir,
-      chapterNumber: targetChapter,
-      baselineChapter,
-      title: targetMeta.title,
-      content,
-      allowReapply: true,
-    });
-    const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
-    let validation = await validator.validate(
-      content,
-      targetChapter,
-      oldState,
-      repairedOutput.updatedState,
-      oldHooks,
-      repairedOutput.updatedHooks,
-      pipelineLang,
-    );
-
-    if (!validation.passed || validation.repairRequired) {
-      const recovery = await retrySettlementAfterValidationFailure({
-        writer,
-        validator,
-        book,
-        bookDir,
-        chapterNumber: targetChapter,
-        baselineChapter,
-        title: targetMeta.title,
-        content,
-        oldState,
-        oldHooks,
-        originalValidation: validation,
-        language: pipelineLang,
-        logWarn: (message) => this.logWarn(pipelineLang, message),
-        logger: this.config.logger,
-      });
-      if (recovery.kind !== "recovered") {
-        throw new Error(
-          recovery.issues[0]?.description
-            ?? `State repair still failed for chapter ${targetChapter}.`,
-        );
-      }
-      repairedOutput = recovery.output;
-      validation = recovery.validation;
-    }
-
-    if (!validation.passed || validation.repairRequired) {
-      throw new Error(`State repair still failed for chapter ${targetChapter}.`);
-    }
-
-    this.currentAbortSignal()?.throwIfAborted();
-    return this.publishChapterMutation(bookId, async () => {
-    await this.state.invalidateChapterStateFrom(bookId, targetChapter);
-    if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
-      throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state repair.`);
-    }
-    await writer.saveChapter(bookDir, repairedOutput, gp.numericalSystem, pipelineLang, { preserveBody: true });
-    await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, repairedOutput);
-    await this.state.snapshotState(bookId, targetChapter);
-
-    const baseStatus = resolveStateDegradedBaseStatus(targetMeta);
-    const degradedMetadata = parseStateDegradedReviewNote(targetMeta.reviewNote);
-    const injectedIssues = new Set(degradedMetadata?.injectedIssues ?? []);
-    index[targetIndex] = {
-      ...targetMeta,
-      status: baseStatus,
-      stateIntegrity: { status: "valid" },
-      updatedAt: new Date().toISOString(),
-      auditIssues: targetMeta.auditIssues.filter((issue) => !injectedIssues.has(issue)),
-      reviewNote: undefined,
-    };
-    await this.state.saveChapterIndex(bookId, (await this.state.loadChapterIndex(bookId)).map((chapter) =>
-      chapter.number === targetChapter ? index[targetIndex]! : chapter,
-    ));
-
-    const repairedPassesAudit = baseStatus !== "audit-failed";
-    await this.syncNarrativeMemoryIndex(bookId);
-    await this.syncCurrentStateFactHistory(bookId, targetChapter);
-    return {
-      chapterNumber: targetChapter,
-      title: targetMeta.title,
-      wordCount: targetMeta.wordCount,
-      auditResult: {
-        passed: repairedPassesAudit,
-        issues: [],
-      summary: repairedPassesAudit ? "state repaired" : "state repaired but chapter still needs review",
-      },
-      revised: false,
-      status: baseStatus,
-      lengthWarnings: targetMeta.lengthWarnings,
-      lengthTelemetry: targetMeta.lengthTelemetry,
-      tokenUsage: targetMeta.tokenUsage,
-    };
-    });
+    const index = await this.state.loadChapterIndex(bookId);
+    const targetChapter = chapterNumber ?? index.at(-1)?.number;
+    const target = index.find(chapter => chapter.number === targetChapter);
+    if (!target || !isChapterStateDegraded(target)) throw new Error(`Chapter ${targetChapter} is not state-degraded.`);
+    return this._resyncChapterArtifactsLocked(bookId, targetChapter);
   }
 
   private async _resyncChapterArtifactsLocked(
     bookId: string,
     chapterNumber?: number,
-    options: { readonly allowNewHooks?: boolean } = {},
+    options: { readonly allowNewHooks?: boolean; readonly resumeAttemptId?: string; readonly resumeAction?: "revalidate" | "repair" } = {},
   ): Promise<ChapterPipelineResult> {
-    const book = await this.state.loadBookConfig(bookId);
     const bookDir = this.state.bookDir(bookId);
-    const stageLanguage = await this.resolveBookLanguage(book);
     const index = [...(await this.state.loadChapterIndex(bookId))];
     if (index.length === 0) {
       throw new Error(`Book "${bookId}" has no persisted chapters to sync.`);
@@ -2690,6 +2619,10 @@ export class PipelineRunner {
     const targetMeta = index[targetIndex]!;
     const latestChapter = Math.max(...index.map((chapter) => chapter.number));
     await this.assertNoPendingStateRepair(bookId, targetChapter);
+
+    const inputsBeforeRead = await captureCandidateInputs(bookDir, targetChapter);
+    const book = await this.state.loadBookConfig(bookId);
+    const stageLanguage = await this.resolveBookLanguage(book);
 
     this.logStage(stageLanguage, { zh: "根据已编辑正文同步真相文件与索引", en: "syncing truth files and indexes from edited chapter body" });
     const { profile: gp } = await this.loadGenreProfile(book.genre);
@@ -2706,7 +2639,17 @@ export class PipelineRunner {
       );
     });
 
-    const reducedControlInput = targetChapter !== latestChapter ? undefined : await this.createGovernedArtifacts(
+    const priorAttempt = options.resumeAttemptId ? await loadSettlementAttempt(bookDir, options.resumeAttemptId) : undefined;
+    if (priorAttempt) {
+      const currentInputs = await captureCandidateInputs(bookDir, targetChapter, priorAttempt.context.settlementGuidance);
+      if (JSON.stringify(currentInputs) !== JSON.stringify(priorAttempt.inputs)) {
+        throw Object.assign(new Error("SETTLEMENT_INPUTS_CHANGED: create a new recovery attempt from the current inputs."), { reasonCode: "SETTLEMENT_INPUTS_CHANGED", attemptId: priorAttempt.attemptId, stage: "preflight" });
+      }
+      if (priorAttempt.chapter !== targetChapter || priorAttempt.output.content !== content || priorAttempt.context.baselineChapter !== baselineChapter) {
+        throw Object.assign(new Error("SETTLEMENT_INPUTS_CHANGED"), { reasonCode: "SETTLEMENT_INPUTS_CHANGED", stage: "preflight" });
+      }
+    }
+    const reducedControlInput = priorAttempt || targetChapter !== latestChapter ? undefined : await this.createGovernedArtifacts(
       book,
       bookDir,
       targetChapter,
@@ -2715,36 +2658,50 @@ export class PipelineRunner {
     );
     // Latest-chapter context already carries the brief. Middle chapters use only
     // their snapshot baseline plus explicit guidance, never future live context.
-    const settlementGuidance = targetChapter !== latestChapter
+    const settlementGuidance = priorAttempt ? priorAttempt.context.settlementGuidance : targetChapter !== latestChapter
       ? this.config.externalContext?.trim() || undefined
       : undefined;
 
     const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
-    let syncedOutput = await writer.settleChapterState({
+    const context = priorAttempt?.context ?? { baselineChapter, settlementGuidance,
+      allowNewHooks: options.allowNewHooks, chapterIntent: reducedControlInput?.plan.intentMarkdown,
+      contextPackage: reducedControlInput?.composed.contextPackage, ruleStack: reducedControlInput?.composed.ruleStack };
+    const recording = await captureSettlementRecording(bookDir, targetChapter, content, context, true);
+    if (JSON.stringify(inputsBeforeRead) !== JSON.stringify(await captureCandidateInputs(bookDir, targetChapter))) {
+      throw Object.assign(new Error("SETTLEMENT_INPUTS_CHANGED: inputs changed while preparing settlement."), {
+        reasonCode: "SETTLEMENT_INPUTS_CHANGED", stage: "preflight", attemptId: priorAttempt?.attemptId,
+      });
+    }
+    const priorEvents = priorAttempt ? await readSettlementEvents(bookDir, priorAttempt.attemptId) : [];
+    const lastValidation = priorEvents.filter(event => event.type === "rejected" || event.type === "validated").at(-1)?.data as ValidationResult | undefined;
+    let syncedOutput = priorAttempt && options.resumeAction === "revalidate" ? priorAttempt.output : await writer.settleChapterState({
       book,
       bookDir,
       chapterNumber: targetChapter,
-      baselineChapter,
-      allowNewHooks: options.allowNewHooks,
-      settlementGuidance,
+      ...context,
       title: targetMeta.title,
       content,
-      chapterIntent: reducedControlInput?.plan.intentMarkdown,
-      contextPackage: reducedControlInput?.composed.contextPackage,
-      ruleStack: reducedControlInput?.composed.ruleStack,
+      previousSettlement: priorAttempt?.output,
+      validationFeedback: priorAttempt ? buildStateValidationFeedback(lastValidation?.warnings ?? [], pipelineLang) : undefined,
       allowReapply: true,
     });
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
-    let validation = await validator.validate(
-      content,
-      targetChapter,
-      oldState,
-      syncedOutput.updatedState,
-      oldHooks,
-      syncedOutput.updatedHooks,
-      pipelineLang,
-    );
+    const recorded = priorAttempt?.status === "validated" && options.resumeAction === "revalidate"
+      && lastValidation?.passed === true && !lastValidation.repairRequired && Array.isArray(lastValidation.warnings)
+      ? { attempt: priorAttempt, validation: lastValidation }
+      : await validateRecordedSettlement({ validator, bookDir, chapterNumber: targetChapter,
+        content, output: syncedOutput, oldState, oldHooks, language: pipelineLang, recording, parentAttemptId: priorAttempt?.attemptId });
+    let attemptId = recorded.attempt.attemptId;
+    let validation = recorded.validation;
 
+    if ((!validation.passed || validation.repairRequired) && priorAttempt) {
+      const reasonCode = lastValidation && settlementMadeNoProgress(priorAttempt.output, syncedOutput, lastValidation, validation)
+        ? "SETTLEMENT_NO_PROGRESS" : "SETTLEMENT_REJECTED";
+      await appendSettlementEvent(bookDir, attemptId, { type: "rejected", data: { ...validation, reasonCode } });
+      throw Object.assign(new Error(validation.warnings.map(issue => issue.description).join("; ") || "Settlement rejected"), {
+        reasonCode, stage: "validation", attemptId, issues: validation.issues ?? validation.warnings,
+      });
+    }
     if (!validation.passed || validation.repairRequired) {
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
@@ -2767,26 +2724,38 @@ export class PipelineRunner {
         oldState,
         oldHooks,
         originalValidation: validation,
+        previousSettlement: syncedOutput, recording, parentAttemptId: attemptId,
         language: pipelineLang,
         logWarn: (message) => this.logWarn(pipelineLang, message),
         logger: this.config.logger,
       });
       if (recovery.kind !== "recovered") {
-        throw new Error(
-          recovery.issues[0]?.description
-            ?? `Chapter sync still failed for chapter ${targetChapter}.`,
-        );
+        throw Object.assign(new Error(recovery.issues.map(issue => issue.description).join("; ") || `Chapter sync still failed for chapter ${targetChapter}.`), {
+          reasonCode: recovery.reasonCode ?? "SETTLEMENT_REJECTED", stage: "validation", attemptId: recovery.attemptId ?? attemptId, issues: recovery.validation?.issues ?? recovery.issues,
+        });
       }
       syncedOutput = recovery.output;
       validation = recovery.validation;
+      attemptId = recovery.attemptId ?? attemptId;
     }
 
     if (!validation.passed || validation.repairRequired) {
       throw new Error(`Chapter sync still failed for chapter ${targetChapter}.`);
     }
 
-    this.currentAbortSignal()?.throwIfAborted();
+    try { this.currentAbortSignal()?.throwIfAborted(); } catch (error) {
+      throw Object.assign(new Error(String(error), { cause: error }), {
+        reasonCode: "SETTLEMENT_CANCELLED", stage: "commit", attemptId,
+      });
+    }
     return this.publishChapterMutation(bookId, async () => {
+    const currentInputs = await captureCandidateInputs(bookDir, targetChapter, context.settlementGuidance);
+    if (JSON.stringify(currentInputs) !== JSON.stringify(recording.inputs)) {
+      throw Object.assign(new Error("SETTLEMENT_INPUTS_CHANGED: input changed before publication."), {
+        reasonCode: "SETTLEMENT_INPUTS_CHANGED", stage: "preflight", attemptId,
+      });
+    }
+    this.currentAbortSignal()?.throwIfAborted();
     await this.state.invalidateChapterStateFrom(bookId, targetChapter);
     if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
       throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state sync.`);
@@ -2794,6 +2763,8 @@ export class PipelineRunner {
     await writer.saveChapter(bookDir, syncedOutput, gp.numericalSystem, pipelineLang, { preserveBody: true });
     await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, syncedOutput);
     await this.state.snapshotState(bookId, targetChapter);
+    await markSettlementApplied(bookDir, attemptId);
+    if (priorAttempt) await markSettlementApplied(bookDir, priorAttempt.attemptId);
 
     const finalStatus: "ready-for-review" | "audit-failed" = isChapterStateDegraded(targetMeta)
       ? resolveStateDegradedBaseStatus(targetMeta)
@@ -2840,6 +2811,10 @@ export class PipelineRunner {
       lengthTelemetry: targetMeta.lengthTelemetry,
       tokenUsage: targetMeta.tokenUsage,
     };
+    }).catch(error => {
+      throw Object.assign(new Error(String(error), { cause: error }), {
+        ...settlementFailure(error), stage: (error as { stage?: string }).stage ?? "commit", attemptId,
+      });
     });
   }
 

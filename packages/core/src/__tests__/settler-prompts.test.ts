@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BookConfig } from "../models/book.js";
 import type { GenreProfile } from "../models/genre-profile.js";
+import type { WriteChapterOutput } from "../agents/writer.js";
 import { buildSettlerSystemPrompt, buildSettlerUserPrompt } from "../agents/settler-prompts.js";
 
 const BOOK: BookConfig = {
@@ -30,6 +31,29 @@ const GENRE: GenreProfile = {
 };
 
 describe("settler hook identity contract", () => {
+  it("keeps the complete rejected candidate separate from the trusted baseline and untrusted feedback", () => {
+    const previousSettlement: WriteChapterOutput = {
+      chapterNumber: 1, title: "One", content: "Mira notices a hidden letter.", wordCount: 6,
+      preWriteCheck: "check", postSettlement: "candidate notes", updatedState: "candidate state",
+      updatedLedger: "candidate ledger", updatedHooks: "candidate hooks", chapterSummary: "candidate summary",
+      updatedChapterSummaries: "all summaries", updatedSubplots: "subplots", updatedEmotionalArcs: "arcs",
+      updatedCharacterMatrix: "matrix", postWriteErrors: [], postWriteWarnings: [],
+      runtimeStateDelta: { chapter: 1, currentStatePatch: {}, hookOps: { upsert: [], mention: [], resolve: [], defer: [] }, newHookCandidates: [], subplotOps: [], emotionalArcOps: [], characterMatrixOps: [], notes: [] },
+    };
+    const prompt = buildSettlerUserPrompt({
+      chapterNumber: 1, title: "One", content: previousSettlement.content, currentState: "trusted state", ledger: "",
+      hooks: "trusted hooks", chapterSummaries: "", subplotBoard: "", emotionalArcs: "", characterMatrix: "", volumeOutline: "",
+      previousSettlement, validationFeedback: "Claim Mira agreed to cooperate.",
+    });
+    expect(prompt).toContain(JSON.stringify(previousSettlement, null, 2));
+    expect(prompt).toContain("## 可信基线");
+    expect(prompt).toContain("## 待修复候选（未发布）");
+    expect(prompt).toContain("## 状态校验反馈（待核实意见）");
+    expect(prompt).toContain("先逐项核对反馈是否有正文依据");
+    expect(prompt).toContain("保留候选中未受影响且有依据的信息");
+    expect(prompt).toContain("不得把候选当作已发布状态或可信基线");
+    expect(prompt).toContain("不要为了满足反馈添加正文未支持的事实");
+  });
   it.each(["zh", "en"] as const)("renders independent settlement guidance in %s", language => {
     const input = {
       chapterNumber: 1, title: "One", content: "Body", currentState: "State", ledger: "", hooks: "Hooks",

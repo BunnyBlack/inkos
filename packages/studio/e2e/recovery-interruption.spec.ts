@@ -4,6 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { withBookTransaction } from "../../core/dist/state/book-transaction.js";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
+import { createSettlementAttempt, appendSettlementEvent } from "../../core/dist/pipeline/settlement-attempt.js";
 
 // Run against an actual Studio server pointed at this dedicated synthetic root.
 // The Windows runner in temp/recovery-browser sets the same root for the server.
@@ -41,6 +42,37 @@ async function legacyCandidate(book: string, candidateId: string) {
   await writeFile(join(directory, "candidate.json"), record, "utf8");
   return record;
 }
+
+test("persisted settlement evidence survives reload and bounded action failures remain reviewable", async ({ page }) => {
+  const { id, book } = await emptyBook("settlement-evidence");
+  const prose = "Mira reads a hidden letter. She makes no promise.";
+  await writeFile(join(book, "chapters", "0001_retained.md"), prose, "utf8");
+  const attempt = await createSettlementAttempt(book, {
+    chapter: 1, inputs: { sourceHash: "synthetic", baselineHash: "synthetic", controlHash: "synthetic" }, context: { baselineChapter: 0 },
+    output: { chapterNumber: 1, title: "One", content: prose, wordCount: 10, preWriteCheck: "", postSettlement: "notes", updatedState: "Mira reads the letter.", updatedLedger: "", updatedHooks: "Unresolved letter", chapterSummary: "summary", updatedSubplots: "", updatedEmotionalArcs: "", updatedCharacterMatrix: "", postWriteErrors: [], postWriteWarnings: [] },
+  });
+  await appendSettlementEvent(book, attempt.attemptId, { type: "rejected", data: { reasonCode: "SEMANTIC_REJECTION", issues: ["Unsupported agreement", "<script>not executable</script>"] } });
+  // Only resume is a transport substitute: diagnostics and status use the real server/storage.
+  const actions: string[] = [];
+  await page.route(`**/api/v1/books/${id}/settlements/${attempt.attemptId}/resume`, async route => {
+    actions.push(route.request().postDataJSON().action);
+    await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ status: "failed", attemptId: attempt.attemptId, reasonCode: "SETTLEMENT_NO_PROGRESS", stage: "validation", issues: ["Synthetic bounded rejection"] }) });
+  });
+  await page.goto(`/#/book/${id}/settings`);
+  await page.getByRole("combobox", { name: "Settlement attempts" }).selectOption(attempt.attemptId);
+  await page.getByRole("button", { name: "Inspect settlement evidence" }).click();
+  await expect(page.getByLabel("Settlement evidence")).toContainText("Unsupported agreement");
+  await expect(page.getByLabel("Settlement evidence")).toContainText("<script>not executable</script>");
+  await expect(page.getByLabel("Settlement evidence").locator("script")).toHaveCount(0);
+  await page.getByRole("button", { name: "Revalidate candidate", exact: true }).click();
+  await expect(page.getByText("Synthetic bounded rejection", { exact: false })).toBeVisible();
+  expect(actions).toEqual(["revalidate"]);
+  await page.reload();
+  await page.getByRole("combobox", { name: "Settlement attempts" }).selectOption(attempt.attemptId);
+  await page.getByRole("button", { name: "Inspect settlement evidence" }).click();
+  await expect(page.getByLabel("Settlement evidence")).toContainText("Unsupported agreement");
+  expect(await readFile(join(book, "chapters", "0001_retained.md"), "utf8")).toBe(prose);
+});
 
 test("orphan chapters remain selectable through preview and recovery submission", async ({ page }) => {
   const { id, book } = await emptyBook("orphan-target");

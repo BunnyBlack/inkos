@@ -11,6 +11,78 @@ import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import type { ContextPackage, RuleStack } from "../models/input-governance.js";
 import type { LengthLanguage } from "../utils/length-metrics.js";
+import { captureCandidateInputs, type CandidateInputs } from "./recovery-candidate.js";
+import { createSettlementAttempt, appendSettlementEvent, type SettlementAttempt } from "./settlement-attempt.js";
+
+export interface SettlementRecording {
+  inputs: CandidateInputs;
+  resumable: boolean;
+  context: SettlementAttempt["context"];
+}
+
+export async function captureSettlementRecording(bookDir: string, chapter: number, content: string,
+  context: SettlementAttempt["context"], resumable = false): Promise<SettlementRecording> {
+  if (resumable) return { inputs: await captureCandidateInputs(bookDir, chapter, context.settlementGuidance), context, resumable };
+  // Non-published prose can be diagnosed but must resume through its original
+  // write/revision workflow, never through the persisted-body recovery endpoint.
+  return { inputs: await captureCandidateInputs(bookDir, chapter, context.settlementGuidance, Buffer.from(content, "utf8")), context, resumable };
+}
+
+export function settlementFailure(error: unknown): { reasonCode: string; stage: string; attemptId?: string; issues?: unknown; nextActions: string[] } {
+  const failure = error as { reasonCode?: string; stage?: string; attemptId?: string; issues?: unknown };
+  return { reasonCode: failure?.reasonCode ?? "CHAPTER_RECOVERY_FAILED", stage: failure?.stage ?? "settlement",
+    attemptId: failure?.attemptId, issues: failure?.issues,
+    nextActions: failure?.attemptId ? ["inspect-settlement", "revalidate", "repair"] : ["inspect-recovery"] };
+}
+
+export function settlementMadeNoProgress(previous: WriteChapterOutput, next: WriteChapterOutput,
+  previousValidation: ValidationResult, nextValidation: ValidationResult): boolean {
+  const projection = (output: WriteChapterOutput) => JSON.stringify({ state: output.updatedState, hooks: output.updatedHooks,
+    ledger: output.updatedLedger, summaries: output.updatedChapterSummaries, summary: output.chapterSummary,
+    subplots: output.updatedSubplots, emotionalArcs: output.updatedEmotionalArcs, characterMatrix: output.updatedCharacterMatrix,
+    delta: output.runtimeStateDelta, snapshot: output.runtimeStateSnapshot });
+  const verdict = (validation: ValidationResult) => JSON.stringify({ passed: validation.passed,
+    repairRequired: Boolean(validation.repairRequired), warnings: validation.warnings, issues: validation.issues });
+  return projection(previous) === projection(next) && verdict(previousValidation) === verdict(nextValidation);
+}
+
+export async function validateRecordedSettlement(params: {
+  validator: Pick<StateValidatorAgent, "validate">; bookDir: string; chapterNumber: number;
+  content: string; output: WriteChapterOutput; oldState: string; oldHooks: string;
+  language: LengthLanguage; recording: SettlementRecording; parentAttemptId?: string;
+  authorityContext?: import("../agents/state-validator.js").StateValidationAuthorityContext;
+}): Promise<{ attempt: SettlementAttempt; validation: ValidationResult }> {
+  const attempt = await createSettlementAttempt(params.bookDir, { chapter: params.chapterNumber,
+    inputs: params.recording.inputs, context: params.recording.context, output: params.output,
+    resumable: params.recording.resumable, parentAttemptId: params.parentAttemptId });
+  try {
+    await appendSettlementEvent(params.bookDir, attempt.attemptId, { type: "validation-input", data: {
+      content: params.content, oldState: params.oldState, oldHooks: params.oldHooks, language: params.language,
+      authorityContext: params.authorityContext,
+    } });
+    const validation = await params.validator.validate(params.content, params.chapterNumber, params.oldState,
+      params.output.updatedState, params.oldHooks, params.output.updatedHooks, params.language, params.authorityContext,
+      { onDiagnostic: async event => { await appendSettlementEvent(params.bookDir, attempt.attemptId, { type: `validator-${event.phase}`, data: event }); } });
+    await appendSettlementEvent(params.bookDir, attempt.attemptId, {
+      type: validation.passed && !validation.repairRequired ? "validated" : "rejected", data: validation,
+    });
+    return { attempt, validation };
+  } catch (error) {
+    const reasonCode = (error as { reasonCode?: string }).reasonCode ?? "STATE_VALIDATION_FAILED";
+    try {
+      await appendSettlementEvent(params.bookDir, attempt.attemptId, { type: "rejected", data: { reasonCode, error: String(error) } });
+    } catch (evidenceCause) {
+      // The candidate already exists. Keep its identifier and both failures even
+      // when the disk cannot accept the rejection event; never return validation.
+      throw Object.assign(new Error("SETTLEMENT_EVIDENCE_WRITE_FAILED", { cause: error }), {
+        reasonCode: "SETTLEMENT_EVIDENCE_WRITE_FAILED", stage: "evidence", attemptId: attempt.attemptId, evidenceCause,
+      });
+    }
+    throw Object.assign(new Error(String(error), { cause: error }), {
+      reasonCode, stage: reasonCode === "SETTLEMENT_EVIDENCE_WRITE_FAILED" ? "evidence" : "validation", attemptId: attempt.attemptId,
+    });
+  }
+}
 
 export interface SettlementRetryParams {
   readonly writer: Pick<WriterAgent, "settleChapterState">;
@@ -31,6 +103,10 @@ export interface SettlementRetryParams {
   readonly oldState: string;
   readonly oldHooks: string;
   readonly originalValidation: ValidationResult;
+  readonly previousSettlement?: WriteChapterOutput;
+  readonly recording?: SettlementRecording;
+  readonly parentAttemptId?: string;
+  readonly authorityContext?: import("../agents/state-validator.js").StateValidationAuthorityContext;
   readonly language: LengthLanguage;
   readonly logWarn?: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
@@ -41,10 +117,14 @@ export type SettlementRetryResult =
     readonly kind: "recovered";
     readonly output: WriteChapterOutput;
     readonly validation: ValidationResult;
+    readonly attemptId?: string;
   }
   | {
     readonly kind: "degraded";
     readonly issues: ReadonlyArray<AuditIssue>;
+    readonly attemptId?: string;
+    readonly reasonCode?: string;
+    readonly validation?: ValidationResult;
   };
 
 export async function retrySettlementAfterValidationFailure(
@@ -55,7 +135,12 @@ export async function retrySettlementAfterValidationFailure(
     en: `State validation failed; retrying settlement only for chapter ${params.chapterNumber}`,
   });
 
-  const retryOutput = await params.writer.settleChapterState({
+  let retryOutput: WriteChapterOutput;
+  if (params.parentAttemptId) await appendSettlementEvent(params.bookDir, params.parentAttemptId, { type: "settlement-request", data: {
+    chapter: params.chapterNumber, baselineChapter: params.baselineChapter, content: params.content,
+    validation: params.originalValidation, guidance: params.settlementGuidance,
+  } });
+  try { retryOutput = await params.writer.settleChapterState({
     book: params.book,
     bookDir: params.bookDir,
     chapterNumber: params.chapterNumber,
@@ -72,11 +157,25 @@ export async function retrySettlementAfterValidationFailure(
       params.originalValidation.warnings,
       params.language,
     ),
-  });
+    previousSettlement: params.previousSettlement,
+  }); } catch (error) {
+    throw Object.assign(new Error(String(error), { cause: error }), {
+      reasonCode: (error as { reasonCode?: string }).reasonCode ?? "SETTLEMENT_GENERATION_FAILED",
+      stage: "settlement", attemptId: params.parentAttemptId,
+    });
+  }
 
   let retryValidation: ValidationResult;
+  let attemptId: string | undefined;
   try {
-    retryValidation = await params.validator.validate(
+    if (params.recording) {
+      const recorded = await validateRecordedSettlement({ validator: params.validator, bookDir: params.bookDir,
+        chapterNumber: params.chapterNumber, content: params.content, output: retryOutput,
+        oldState: params.oldState, oldHooks: params.oldHooks, language: params.language,
+        recording: params.recording, parentAttemptId: params.parentAttemptId, authorityContext: params.authorityContext });
+      retryValidation = recorded.validation;
+      attemptId = recorded.attempt.attemptId;
+    } else retryValidation = await params.validator.validate(
       params.content,
       params.chapterNumber,
       params.oldState,
@@ -84,9 +183,10 @@ export async function retrySettlementAfterValidationFailure(
       params.oldHooks,
       retryOutput.updatedHooks,
       params.language,
+      params.authorityContext,
     );
   } catch (error) {
-    throw new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`);
+    throw Object.assign(new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`, { cause: error }), settlementFailure(error));
   }
 
   if (retryValidation.warnings.length > 0) {
@@ -104,12 +204,19 @@ export async function retrySettlementAfterValidationFailure(
       kind: "recovered",
       output: retryOutput,
       validation: retryValidation,
+      attemptId,
     };
   }
 
+  const reasonCode = params.previousSettlement && settlementMadeNoProgress(params.previousSettlement, retryOutput,
+    params.originalValidation, retryValidation) ? "SETTLEMENT_NO_PROGRESS" : "SETTLEMENT_REJECTED";
+  if (attemptId) await appendSettlementEvent(params.bookDir, attemptId, { type: "rejected", data: { ...retryValidation, reasonCode } });
   return {
     kind: "degraded",
     issues: buildStateDegradedIssues(retryValidation.warnings, params.language),
+    attemptId,
+    reasonCode,
+    validation: retryValidation,
   };
 }
 

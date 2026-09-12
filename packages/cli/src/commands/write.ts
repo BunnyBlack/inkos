@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { listSettlementAttempts, loadSettlementAttempt, readSettlementEvents, readBookConsistently } from "@actalk/inkos-core";
 import { PipelineRunner, StateManager, resolveChapterReviewMode, inspectBookHealth, planBookRecovery, listRecoveryCandidates, findRecoveryBaseline, discardRecoveryCandidate } from "@actalk/inkos-core";
 import { createInterface } from "node:readline";
 import { loadConfig, buildPipelineConfig, findProjectRoot, getLegacyMigrationHint, resolveContext, resolveBookId, log, logError } from "../utils.js";
@@ -28,9 +29,9 @@ async function recoveryArguments(args: ReadonlyArray<string>, root: string): Pro
 }
 
 function recoveryError(error: unknown, json: boolean): void {
-  const failure = error as { candidateId?: string; reasonCode?: string; code?: string; stage?: string; name?: string };
-  if (json) log(JSON.stringify({ status: failure.name === "AbortError" ? "cancelled" : "failed", error: String(error), candidateId: failure.candidateId, reasonCode: failure.reasonCode ?? failure.code, stage: failure.stage }));
-  else logError(`Recovery failed / 恢复失败: ${String(error)}${failure.candidateId ? ` Candidate: ${failure.candidateId}; use write resume-candidate.` : ""}`);
+  const failure = error as { candidateId?: string; attemptId?: string; reasonCode?: string; code?: string; stage?: string; name?: string; issues?: unknown[]; nextActions?: unknown[] };
+  if (json) log(JSON.stringify({ status: failure.name === "AbortError" ? "cancelled" : "failed", error: String(error), candidateId: failure.candidateId, attemptId: failure.attemptId, reasonCode: failure.reasonCode ?? failure.code, stage: failure.stage, issues: failure.issues, nextActions: failure.nextActions }));
+  else logError(`Recovery failed / 恢复失败: ${String(error)}${failure.attemptId ? ` Settlement: ${failure.attemptId}; use write inspect-settlement.` : ""}${failure.candidateId ? ` Candidate: ${failure.candidateId}; use write resume-candidate.` : ""}`);
   process.exitCode = 1;
 }
 
@@ -57,8 +58,9 @@ writeCommand.command("recovery-status")
       const bookId = await resolveBookId(bookIdArg, root);
       const health = await inspectBookHealth(new StateManager(root).bookDir(bookId));
       const candidates = await listRecoveryCandidates(new StateManager(root).bookDir(bookId));
+      const settlementAttempts = await listSettlementAttempts(new StateManager(root).bookDir(bookId));
       const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(new StateManager(root).bookDir(bookId));
-      const result = { health, candidates, availableBaselineBackup, ...(opts.chapter ? { plan: planBookRecovery(health, recoveryTarget(opts.chapter)) } : {}) };
+      const result = { health, candidates, settlementAttempts, availableBaselineBackup, ...(opts.chapter ? { plan: planBookRecovery(health, recoveryTarget(opts.chapter)) } : {}) };
       log(JSON.stringify(result, null, 2));
     } catch (error) { recoveryError(error, opts.json); }
   });
@@ -115,6 +117,37 @@ writeCommand.command("discard-candidate")
       try { await discardRecoveryCandidate(state.bookDir(bookId), candidateId); }
       finally { await release(); }
       log(JSON.stringify({ status: "discarded", candidateId, preservesBodies: true }));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("inspect-settlement")
+  .description("Read a saved settlement and validation evidence without model calls")
+  .argument("<args...>", "[book-id] <attempt-id>")
+  .option("--json", "Output JSON")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      const root = findProjectRoot();
+      const { bookId, value: attemptId } = await recoveryArguments(args, root);
+      const bookDir = new StateManager(root).bookDir(bookId);
+      const result = await readBookConsistently(bookDir, async () => ({ attempt: await loadSettlementAttempt(bookDir, attemptId), events: await readSettlementEvents(bookDir, attemptId) }));
+      log(JSON.stringify(result, null, 2));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("resume-settlement")
+  .description("Revalidate or repair a preserved settlement within a finite budget")
+  .argument("<args...>", "[book-id] <attempt-id>")
+  .requiredOption("--action <action>", "revalidate or repair")
+  .option("--json", "Output JSON")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      if (opts.action !== "revalidate" && opts.action !== "repair") throw new Error("INVALID_SETTLEMENT_ACTION");
+      const root = findProjectRoot();
+      const { bookId, value: attemptId } = await recoveryArguments(args, root);
+      const pipeline = new PipelineRunner(buildPipelineConfig(await loadConfig(), root));
+      const result = await pipeline.resumeSettlementAttempt(bookId, attemptId, opts.action);
+      log(JSON.stringify(result, null, 2));
+      if (!["applied", "unchanged"].includes(result.status)) process.exitCode = 1;
     } catch (error) { recoveryError(error, opts.json); }
   });
 

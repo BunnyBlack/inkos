@@ -55,7 +55,7 @@ describe("StateValidatorAgent", () => {
     });
   });
 
-  it("returns a structured repair verdict without classifying warning text in code", async () => {
+  it("completes legacy repair evidence without classifying warning text in code", async () => {
     const agent = new StateValidatorAgent({
       client: {
         provider: "openai",
@@ -67,9 +67,16 @@ describe("StateValidatorAgent", () => {
       projectRoot: process.cwd(),
     });
     vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
-      .mockResolvedValue({
+      .mockResolvedValueOnce({
         content: "REPAIR\n[missing_state_update] 角色已到码头，但状态卡仍在车站",
         usage: ZERO_USAGE,
+      }).mockResolvedValueOnce({
+        content: JSON.stringify({ verdict: "REPAIR", issues: [{
+          category: "missing_state_update", description: "角色已到码头，但状态卡仍在车站",
+          blocking: true, kind: "omission", basis: "explicit", target: "candidate-state",
+          rationale: "正文已经明确抵达码头，候选仍停留在车站。",
+          evidence: [{ source: "chapter", quote: "林舟抵达码头。" }],
+        }] }), usage: ZERO_USAGE,
       });
 
     await expect(agent.validate(
@@ -79,7 +86,7 @@ describe("StateValidatorAgent", () => {
       "位置：车站",
       "H1 未推进",
       "H1 未推进",
-    )).resolves.toEqual({
+    )).resolves.toMatchObject({
       passed: false,
       repairRequired: true,
       warnings: [{

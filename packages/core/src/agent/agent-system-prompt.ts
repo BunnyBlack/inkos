@@ -25,13 +25,15 @@ function commonOutputRules(isZh: boolean): string {
 - 不要使用表情符号。
 - 普通讨论要直接回答；明确需要调用工具时，工具调用本身就是回答，不要先写寒暄、理解说明或空泛确认。
 - 需要结构时用短列表；不要虚报工具执行结果。
-- 修订未应用或状态结算失败时，保留候选并报告恢复步骤；不要改写 current_state、pending_hooks、摘要、结构化状态、快照或恢复记录来绕过失败。作者设定仍可通过设定编辑工具修改。`
+- 修订未应用或状态结算失败时，保留候选并报告恢复步骤；不要改写 current_state、pending_hooks、摘要、结构化状态、快照或恢复记录来绕过失败。作者设定仍可通过设定编辑工具修改。
+- 结算失败后先用 recovery_status 和 inspect_settlement_attempt 查看完整候选、证据和所有问题；用户要求继续时使用 resume_settlement_attempt 的 revalidate 或 repair。校验意见必须对照正文核实，不能默认把推断写入角色设定来解锁。遇到 SETTLEMENT_NO_PROGRESS 应停止本轮重试并说明分歧；新的用户请求可以重新续接。`
     : `## Output Rules
 
 - Do not use emoji.
 - Answer ordinary discussion directly. When a tool call is needed, the tool call itself is the answer; do not add filler, acknowledgement, or a plain-text confirmation first.
 - Use short bullets when structure helps; do not claim side effects without successful tool results.
-- When revision is unapplied or settlement fails, preserve the candidate and report recovery steps. Never overwrite current_state, pending_hooks, summaries, structured state, snapshots or recovery records to bypass failure. Author canon remains editable through canon tools.`;
+- When revision is unapplied or settlement fails, preserve the candidate and report recovery steps. Never overwrite current_state, pending_hooks, summaries, structured state, snapshots or recovery records to bypass failure. Author canon remains editable through canon tools.
+- After settlement failure, use recovery_status and inspect_settlement_attempt for the full candidate, evidence and issues. When the user requests continuation, use resume_settlement_attempt with revalidate or repair. Verify feedback against chapter text; never default to adding inferred facts to character canon to unblock validation. Stop this turn on SETTLEMENT_NO_PROGRESS and explain the disagreement; a new user request may resume again.`;
 }
 
 function buildChatPrompt(isZh: boolean): string {

@@ -8,6 +8,8 @@ import type { LengthLanguage } from "../utils/length-metrics.js";
 import {
   buildStateDegradedPersistenceOutput,
   retrySettlementAfterValidationFailure,
+  captureSettlementRecording,
+  validateRecordedSettlement,
 } from "./chapter-state-recovery.js";
 
 export async function validateChapterTruthPersistence(params: {
@@ -32,10 +34,12 @@ export async function validateChapterTruthPersistence(params: {
     ruleStack: RuleStack;
   };
   readonly language: LengthLanguage;
+  readonly recordAttempts?: boolean;
   readonly logWarn: (message: { zh: string; en: string }) => void;
   readonly logger?: Pick<Logger, "warn">;
 }): Promise<{
   readonly validation: ValidationResult;
+  readonly attemptId?: string;
   readonly chapterStatus: "state-degraded" | null;
   readonly degradedIssues: ReadonlyArray<AuditIssue>;
   readonly persistenceOutput: WriteChapterOutput;
@@ -46,9 +50,20 @@ export async function validateChapterTruthPersistence(params: {
   let degradedIssues: ReadonlyArray<AuditIssue> = [];
   let persistenceOutput = params.persistenceOutput;
   let auditResult = params.auditResult;
+  let attemptId: string | undefined;
+  const recording = params.recordAttempts ? await captureSettlementRecording(params.bookDir, params.chapterNumber,
+    params.content, { baselineChapter: params.chapterNumber - 1, chapterIntent: params.reducedControlInput?.chapterIntent,
+      contextPackage: params.reducedControlInput?.contextPackage, ruleStack: params.reducedControlInput?.ruleStack }) : undefined;
 
   try {
-    validation = await params.validator.validate(
+    if (recording) {
+      const recorded = await validateRecordedSettlement({ validator: params.validator, bookDir: params.bookDir,
+        chapterNumber: params.chapterNumber, content: params.content, output: persistenceOutput,
+        oldState: params.previousTruth.oldState, oldHooks: params.previousTruth.oldHooks,
+        language: params.language, authorityContext: params.authorityContext, recording });
+      attemptId = recorded.attempt.attemptId;
+      validation = recorded.validation;
+    } else validation = await params.validator.validate(
       params.content,
       params.chapterNumber,
       params.previousTruth.oldState,
@@ -59,6 +74,7 @@ export async function validateChapterTruthPersistence(params: {
       params.authorityContext,
     );
   } catch (error) {
+    if ((error as { reasonCode?: string }).reasonCode === "SETTLEMENT_EVIDENCE_WRITE_FAILED") throw error;
     params.logger?.warn(`State validation error for chapter ${params.chapterNumber}: ${String(error)}`);
     const errorDescription = params.language === "en"
       ? `State validation unavailable: ${String(error)}`
@@ -72,7 +88,7 @@ export async function validateChapterTruthPersistence(params: {
         : "请先基于已保存正文修复本章 state，再继续后续章节。",
     };
     return {
-      validation: { passed: true, warnings: [] },
+      validation: { passed: false, warnings: [] },
       chapterStatus: "state-degraded",
       degradedIssues: [errorIssue],
       persistenceOutput: buildStateDegradedPersistenceOutput({
@@ -111,6 +127,8 @@ export async function validateChapterTruthPersistence(params: {
       oldState: params.previousTruth.oldState,
       oldHooks: params.previousTruth.oldHooks,
       originalValidation: validation,
+      authorityContext: params.authorityContext,
+      previousSettlement: persistenceOutput, recording, parentAttemptId: attemptId,
       language: params.language,
       logWarn: params.logWarn,
       logger: params.logger,
@@ -119,6 +137,7 @@ export async function validateChapterTruthPersistence(params: {
     if (recovery.kind === "recovered") {
       persistenceOutput = recovery.output;
       validation = recovery.validation;
+      attemptId = recovery.attemptId ?? attemptId;
     } else {
       chapterStatus = "state-degraded";
       degradedIssues = recovery.issues;
@@ -137,6 +156,7 @@ export async function validateChapterTruthPersistence(params: {
 
   return {
     validation,
+    attemptId,
     chapterStatus,
     degradedIssues,
     persistenceOutput,

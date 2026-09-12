@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StateManager } from "@actalk/inkos-core";
 import { withBookTransaction } from "../../../core/dist/state/book-transaction.js";
+import { createSettlementAttempt, appendSettlementEvent } from "../../../core/dist/pipeline/settlement-attempt.js";
 import { createStudioServer } from "./server.js";
 
 let root: string;
@@ -16,6 +17,38 @@ beforeEach(async () => {
   await writeFile(join(book, "chapters/index.json"), "[]", "utf8");
 });
 afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+
+it("rejects invalid settlement actions before constructing model configuration", async () => {
+  const app = createStudioServer({} as never, root);
+  const response = await app.request("/api/v1/books/sample/settlements/11111111-1111-4111-8111-111111111111/resume", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "rewrite-body" }),
+  });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ reasonCode: "INVALID_SETTLEMENT_ACTION" });
+});
+
+it("rejects unsafe settlement IDs without a model call", async () => {
+  const app = createStudioServer({} as never, root);
+  const response = await app.request("/api/v1/books/sample/settlements/not-an-id");
+  expect(response.status).toBe(400);
+  expect(await response.json()).toMatchObject({ reasonCode: "INVALID_SETTLEMENT_ATTEMPT_ID" });
+});
+
+it("reads complete persisted settlement evidence and lists summaries without model configuration", async () => {
+  const attempt = await createSettlementAttempt(book, {
+    chapter: 1, inputs: { sourceHash: "source", baselineHash: "baseline", controlHash: "control" }, context: { baselineChapter: 0 },
+    output: { chapterNumber: 1, title: "One", content: "Mira reads a letter.", wordCount: 5, preWriteCheck: "", postSettlement: "notes", updatedState: "candidate", updatedLedger: "", updatedHooks: "hooks", chapterSummary: "summary", updatedSubplots: "subplots", updatedEmotionalArcs: "arcs", updatedCharacterMatrix: "matrix", postWriteErrors: [], postWriteWarnings: [] },
+  });
+  await appendSettlementEvent(book, attempt.attemptId, { type: "rejected", data: { reasonCode: "SEMANTIC_REJECTION", issues: ["Unproven consent", "Missing evidence"] } });
+  const before = await readFile(join(book, "book.json"));
+  const app = createStudioServer({} as never, root);
+  const detail = await app.request(`/api/v1/books/sample/settlements/${attempt.attemptId}`);
+  expect(detail.status).toBe(200);
+  expect(await detail.json()).toMatchObject({ attempt: { output: attempt.output, status: "rejected" }, events: [{ type: "rejected", data: { issues: ["Unproven consent", "Missing evidence"] } }] });
+  const status = await app.request("/api/v1/books/sample/recovery-status");
+  expect(await status.json()).toMatchObject({ settlementAttempts: [{ attemptId: attempt.attemptId, status: "rejected" }] });
+  expect(await readFile(join(book, "book.json"))).toEqual(before);
+});
 
 it("classifies an interrupted book and restores it with no model configuration", async () => {
   await expect(withBookTransaction(book, async () => {

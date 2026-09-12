@@ -741,6 +741,9 @@ export { ingestMaterial, type IngestMaterialInput, type MaterialAsset } from "./
 export { runWorkerAgent, type WorkerAgentOptions } from "./agent/worker-agent.js";
 export { inspectBookHealth, type BookHealth } from "./state/book-health.js";
 export { listRecoveryCandidates, discardRecoveryCandidate } from "./pipeline/recovery-candidate.js";
+export { listSettlementAttempts, loadSettlementAttempt, readSettlementEvents } from "./pipeline/settlement-attempt.js";
+export type { SettlementAttempt, SettlementAttemptSummary, SettlementEvent } from "./pipeline/settlement-attempt.js";
+export { readBookConsistently } from "./state/book-transaction.js";
 export type { CandidatePublicationPolicy, ResumeCandidateOptions } from "./pipeline/recovery-candidate.js";
 export type { TransactionRecoveryResult } from "./state/book-transaction.js";
 export { findRecoveryBaseline, type RecoveryBaseline } from "./state/recovery-backup.js";

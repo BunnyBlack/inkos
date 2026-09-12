@@ -144,6 +144,7 @@ describe("validateChapterTruthPersistence", () => {
       language: "zh",
       logWarn,
       logger,
+      authorityContext: { bookRules: "The copper token remains in the coat." },
     });
 
     expect(writer.settleChapterState).toHaveBeenCalledTimes(1);
@@ -155,6 +156,7 @@ describe("validateChapterTruthPersistence", () => {
     expect(result.chapterStatus).toBeNull();
     expect(result.persistenceOutput.updatedState).toBe("fixed state");
     expect(result.persistenceOutput.updatedHooks).toBe("fixed hooks");
+    expect(validator.validate.mock.calls[1]?.[7]).toEqual({ bookRules: "The copper token remains in the coat." });
     expect(result.auditResult.issues).toEqual([]);
     expect(logger.warn).toHaveBeenCalledWith("  [unsupported_change] 正文写铜牌在怀里，但 state 说未携带。");
   });
