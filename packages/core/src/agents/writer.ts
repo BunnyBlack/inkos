@@ -1,4 +1,5 @@
 import { BaseAgent } from "./base.js";
+import { chapterNumberFromFilename } from "../utils/chapter-filename.js";
 import type { BookConfig } from "../models/book.js";
 import type { GenreProfile } from "../models/genre-profile.js";
 import type { BookRules } from "../models/book-rules.js";
@@ -635,6 +636,7 @@ export class WriterAgent extends BaseAgent {
     output: WriteChapterOutput,
     numericalSystem: boolean = true,
     language: "zh" | "en" = "zh",
+    options: { readonly preserveBody?: boolean } = {},
   ): Promise<void> {
     const chaptersDir = join(bookDir, "chapters");
     await mkdir(chaptersDir, { recursive: true });
@@ -642,8 +644,10 @@ export class WriterAgent extends BaseAgent {
     const paddedNum = String(output.chapterNumber).padStart(4, "0");
     const filename = `${paddedNum}_${this.sanitizeFilename(output.title)}.md`;
     const existingChapterFiles = await readdir(chaptersDir).catch(() => []);
-    const supersededChapterFiles = existingChapterFiles
-      .filter((file) => file.startsWith(`${paddedNum}_`) && file.endsWith(".md") && file !== filename);
+    const matchingChapterFiles = existingChapterFiles
+      .filter((file) => chapterNumberFromFilename(file) === output.chapterNumber);
+    if (matchingChapterFiles.length > 1) throw new Error(`CHAPTER_BODY_AMBIGUOUS: chapter ${output.chapterNumber}`);
+    const supersededChapterFiles = matchingChapterFiles.filter((file) => file !== filename);
 
     const heading = language === "en"
       ? `# Chapter ${output.chapterNumber}: ${output.title}`
@@ -722,8 +726,8 @@ export class WriterAgent extends BaseAgent {
 
     await commitAtomicFileSet({
       rootDir: bookDir,
-      writes,
-      deletes: supersededChapterFiles.map((file) => join("chapters", file)),
+      writes: options.preserveBody ? writes.filter(write => !write.relativePath.startsWith("chapters")) : writes,
+      deletes: options.preserveBody ? [] : supersededChapterFiles.map((file) => join("chapters", file)),
     });
   }
 

@@ -1,6 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const writeNextChapterMock = vi.fn();
+const rewriteFromChapterMock = vi.fn();
+const unlinkMock = vi.fn();
 const buildPipelineConfigMock = vi.fn();
 const loadConfigMock = vi.fn();
 const loadBookConfigMock = vi.fn();
@@ -10,6 +12,7 @@ const logErrorMock = vi.fn();
 vi.mock("@actalk/inkos-core", () => ({
   PipelineRunner: class {
     writeNextChapter = writeNextChapterMock;
+    rewriteFromChapter = rewriteFromChapterMock;
   },
   StateManager: class {
     async loadBookConfig() {
@@ -24,6 +27,8 @@ vi.mock("@actalk/inkos-core", () => ({
     projectWriting?: { reviewMode?: "auto" | "manual" },
   ) => book.writing?.reviewMode ?? projectWriting?.reviewMode ?? "auto",
 }));
+
+vi.mock("node:fs/promises", async (original) => ({ ...await original<typeof import("node:fs/promises")>(), unlink: unlinkMock }));
 
 vi.mock("../utils.js", () => ({
   loadConfig: loadConfigMock,
@@ -44,6 +49,7 @@ vi.mock("../localization.js", () => ({
 }));
 
 describe("inkos write next review mode", () => {
+  afterEach(() => vi.restoreAllMocks());
   beforeEach(() => {
     vi.clearAllMocks();
     writeNextChapterMock.mockResolvedValue({
@@ -107,5 +113,19 @@ describe("inkos write next review mode", () => {
       "/project",
       expect.objectContaining({ chapterReviewMode: "auto" }),
     );
+  });
+
+  it("delegates rewrite reset and generation to Core without deleting files in the CLI", async () => {
+    vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    loadBookConfigMock.mockResolvedValue({ language: "zh", writing: { reviewMode: "manual" } });
+    loadConfigMock.mockResolvedValue({ llm: {}, writing: { reviewMode: "auto" } });
+    rewriteFromChapterMock.mockResolvedValue({ chapterNumber: 3, title: "Fixture", status: "ready-for-review" });
+    const { writeCommand } = await import("../commands/write.js");
+    await writeCommand.parseAsync(["node", "write", "rewrite", "demo-book", "3", "--force", "--words", "2500", "--brief", "keep focus", "--json"], { from: "node" });
+    expect(rewriteFromChapterMock).toHaveBeenCalledWith("demo-book", 3, 2500);
+    expect(buildPipelineConfigMock).toHaveBeenCalledWith(expect.anything(), "/project", expect.objectContaining({ externalContext: "keep focus", chapterReviewMode: "manual" }));
+    expect(unlinkMock).not.toHaveBeenCalled();
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
+    expect(process.exit).not.toHaveBeenCalled();
   });
 });

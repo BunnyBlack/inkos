@@ -1,4 +1,8 @@
 import { BaseAgent } from "./base.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { safeChildPath } from "../utils/path-safety.js";
 
 export interface ValidationWarning {
   readonly category: string;
@@ -116,7 +120,21 @@ ${chapterContent}`;
         { temperature: 0.1 },
       );
 
-      return this.parseResult(response.content);
+      try { return this.parseResult(response.content); }
+      catch (error) {
+        let diagnosticPath: string | undefined;
+        if (this.ctx.bookId) {
+          try {
+            const bookDir = safeChildPath(join(this.ctx.projectRoot, "books"), this.ctx.bookId);
+            const directory = join(bookDir, "story", "recovery", "validator");
+            const path = join(directory, `${chapterNumber}-${randomUUID()}.json`);
+            await mkdir(directory, { recursive: true });
+            await writeFile(path, JSON.stringify({ chapterNumber, model: this.ctx.model, response: response.content, recordedAt: new Date().toISOString() }), "utf8");
+            diagnosticPath = path;
+          } catch (saveError) { this.log?.warn(`Validator diagnostic could not be saved: ${String(saveError)}`); }
+        }
+        throw Object.assign(new Error(String(error), { cause: error }), { reasonCode: "VALIDATOR_PROTOCOL_INVALID", diagnosticPath });
+      }
     } catch (error) {
       this.log?.warn(`State validation failed: ${error}`);
       throw error;

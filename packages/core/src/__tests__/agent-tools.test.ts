@@ -6,6 +6,9 @@ import { StateManager } from "../state/manager.js";
 import { ArchitectIncompleteFoundationError } from "../agents/architect.js";
 import {
   createReadTool,
+  createRecoveryStatusTool,
+  createRecoverChaptersTool,
+  createResumeRevisionCandidateTool,
   createGenerateCoverTool,
   createSubAgentTool,
   createShortFictionRunTool,
@@ -46,6 +49,31 @@ function contextPipeline<T extends object>(pipeline: T): T & {
 describe("agent deterministic writing tools", () => {
   let root: string;
   let state: StateManager;
+
+  it("delegates recovery status, bounded repair, and candidate resume to Core", async () => {
+    const pipeline = contextPipeline({
+      getRecoveryStatus: vi.fn(async () => ({ health: { stateFrontier: 0 }, plan: { preservesBodies: true } })),
+      recoverChapters: vi.fn(async () => ({ status: "applied", completed: [1], plan: { preservesBodies: true } })),
+      resumeRevisionCandidate: vi.fn(async () => ({ applied: false, status: "unchanged", chapterNumber: 1, candidateId: "candidate-one" })),
+    });
+    const status = await createRecoveryStatusTool(pipeline as any, "harbor").execute("s", { targetChapter: 1 });
+    expect(status.details).toMatchObject({ kind: "recovery_status", bookId: "harbor" });
+    expect(pipeline.getRecoveryStatus).toHaveBeenCalledWith("harbor", 1);
+    const repaired = await createRecoverChaptersTool(pipeline as any, "harbor").execute("r", { targetChapter: 1 });
+    expect(repaired.details).toMatchObject({ status: "applied", preservesBodies: true, chapterNumber: 1 });
+    expect(pipeline.recoverChapters).toHaveBeenCalledWith("harbor", 1);
+    const resumed = await createResumeRevisionCandidateTool(pipeline as any, "harbor").execute("c", { candidateId: "candidate-one" });
+    expect(resumed.details).toMatchObject({ applied: false, candidateId: "candidate-one" });
+    expect(pipeline.resumeRevisionCandidate).toHaveBeenCalledWith("harbor", "candidate-one");
+  });
+
+  it("keeps candidate IDs and transport failure details in revision tool results", async () => {
+    const failure = Object.assign(new Error("validator parse failed"), { candidateId: "candidate-one", reasonCode: "CANDIDATE_VALIDATION_FAILED", stage: "validation" });
+    const pipeline = contextPipeline({ reviseDraft: vi.fn().mockRejectedValue(failure), resumeRevisionCandidate: vi.fn().mockRejectedValue(failure) });
+    const revision = await createSubAgentTool(pipeline as any, "harbor").execute("r", { agent: "reviser", chapterNumber: 1, instruction: "Revise." } as any);
+    const resumed = await createResumeRevisionCandidateTool(pipeline as any, "harbor").execute("c", { candidateId: "candidate-one" });
+    for (const result of [revision, resumed]) expect(result.details).toMatchObject({ status: "failed", candidateId: "candidate-one", reasonCode: "CANDIDATE_VALIDATION_FAILED", stage: "validation", transportError: true });
+  });
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "inkos-agent-tools-"));
@@ -1490,15 +1518,10 @@ describe("agent deterministic writing tools", () => {
   it("rejects unsafe truth file names", async () => {
     const tool = createWriteTruthFileTool({} as never, root, "harbor");
 
-    const result = await tool.execute("tool-truth-unsafe", {
+    await expect(tool.execute("tool-truth-unsafe", {
       fileName: "../escape.md",
       content: "escape",
-    });
-
-    expect(result.content[0]?.type).toBe("text");
-    if (result.content[0]?.type === "text") {
-      expect(result.content[0].text).toContain("Invalid truth file name");
-    }
+    })).rejects.toThrow("Invalid truth file name");
   });
 
   it("persists Play world, visual, player persona, and entity edits without advancing a turn", async () => {

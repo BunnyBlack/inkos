@@ -11,10 +11,15 @@ import {
   buildStateDegradedPersistenceOutput,
   buildStateDegradedReviewNote,
   markChapterStateDegraded,
+  isChapterStateDegraded,
   parseStateDegradedReviewNote,
   resolveStateDegradedBaseStatus,
   retrySettlementAfterValidationFailure,
 } from "../pipeline/chapter-state-recovery.js";
+
+it("keeps explicit stale integrity independent from a passing audit", () => {
+  expect(isChapterStateDegraded({ status: "ready-for-review", stateIntegrity: { status: "stale" } } as ChapterMeta)).toBe(true);
+});
 
 function createBook(): BookConfig {
   return {

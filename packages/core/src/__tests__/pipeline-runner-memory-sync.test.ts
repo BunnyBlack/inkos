@@ -211,6 +211,7 @@ describe("PipelineRunner structured-state memory sync", () => {
       writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n", "utf-8"),
       writeFile(join(storyDir, "chapter_summaries.md"), "# Chapter Summaries\n", "utf-8"),
     ]);
+    await state.snapshotState(bookId, 0);
 
     const runner = new PipelineRunner({
       client: {

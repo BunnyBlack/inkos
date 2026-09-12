@@ -17,6 +17,8 @@ import { writeExportArtifact } from "./export-artifact.js";
 import { safeChildPath } from "../utils/path-safety.js";
 import { deriveBookIdFromTitle } from "../utils/book-id.js";
 import { normalizePlatformOrOther } from "../models/book.js";
+import { assertAuthorDocumentPath, canonChangeAffectsState } from "../agent/operation-policy.js";
+import { withBookTransaction } from "../state/book-transaction.js";
 
 const SAFE_TRUTH_FLAT_FILE_NAMES = new Set([
   "author_intent.md",
@@ -74,7 +76,8 @@ type PipelineLike = Pick<PipelineRunner, "writeNextChapter" | "reviseDraft"> & {
     },
   ) => Promise<void>;
 };
-type StateLike = Pick<StateManager, "ensureControlDocuments" | "bookDir" | "loadBookConfig" | "loadChapterIndex" | "saveChapterIndex" | "listBooks" | "acquireBookLock">;
+type StateLike = Pick<StateManager, "ensureControlDocuments" | "bookDir" | "loadBookConfig" | "loadChapterIndex" | "saveChapterIndex" | "listBooks" | "acquireBookLock">
+  & Partial<Pick<StateManager, "publishBookMutation" | "invalidateChapterStateFrom">>;
 type InstrumentablePipelineLike = PipelineLike & {
   readonly config?: {
     logger?: Logger;
@@ -141,7 +144,9 @@ async function withBookMutationLock<T>(
 ): Promise<T> {
   const releaseLock = await state.acquireBookLock(bookId);
   try {
-    return await task();
+    return state.publishBookMutation
+      ? await state.publishBookMutation(bookId, task)
+      : await withBookTransaction(state.bookDir(bookId), task);
   } finally {
     await releaseLock();
   }
@@ -527,13 +532,22 @@ export function createInteractionToolsFromDeps(
       await state.ensureControlDocuments(bookId);
       await writeFile(join(state.bookDir(bookId), "story", "author_intent.md"), content, "utf-8");
     }),
-    writeTruthFile: async (bookId, fileName, content) => withBookMutationLock(state, bookId, async () => {
-      await state.ensureControlDocuments(bookId);
+    writeTruthFile: async (bookId, fileName, content) => {
       const storyDir = join(state.bookDir(bookId), "story");
       const safeFileName = assertSafeTruthFileName(fileName);
       const targetPath = safeChildPath(storyDir, safeFileName);
-      await mkdir(dirname(targetPath), { recursive: true });
-      await writeFile(targetPath, content, "utf-8");
-    }),
+      await assertAuthorDocumentPath(dirname(state.bookDir(bookId)), targetPath);
+      return withBookMutationLock(state, bookId, async () => {
+        await assertAuthorDocumentPath(dirname(state.bookDir(bookId)), targetPath);
+        await state.ensureControlDocuments(bookId);
+        const before = await readFile(targetPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return undefined;
+          throw error;
+        });
+        await mkdir(dirname(targetPath), { recursive: true });
+        await writeFile(targetPath, content, "utf-8");
+        if (before !== content && canonChangeAffectsState(`story/${safeFileName}`)) await state.invalidateChapterStateFrom?.(bookId, 1);
+      });
+    },
   };
 }

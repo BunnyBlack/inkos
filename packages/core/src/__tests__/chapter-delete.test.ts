@@ -58,6 +58,16 @@ async function setupBook(params: {
 }
 
 describe("deleteLatestChapter", () => {
+  it("falls back past a corrupt snapshot without deleting retained bodies", async () => {
+    const { root, bookDir } = await setupBook({ bookId: "corrupt", chapters: [
+      { number: 1, title: "One", content: "Body one" },
+      { number: 2, title: "Two", content: "Body two" },
+    ], snapshotChapters: [0, 1] });
+    await writeFile(join(bookDir, "story", "snapshots", "1", "snapshot-manifest.json"), "{broken", "utf8");
+    const result = await deleteLatestChapter(new StateManager(root), "corrupt");
+    expect(result.rolledBackTo).toBe(0);
+    await expect(readFile(join(bookDir, "chapters", "0001_One.md"), "utf8")).resolves.toBe("Body one");
+  });
   it("moves the latest chapter file to chapters/.trash and rolls state back", async () => {
     const { root, bookDir } = await setupBook({
       bookId: "delbook",

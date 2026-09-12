@@ -7,6 +7,11 @@ import { randomUUID } from "node:crypto";
 import {
   StateManager,
   PipelineRunner,
+  inspectBookHealth,
+  findRecoveryBaseline,
+  listRecoveryCandidates,
+  discardRecoveryCandidate,
+  planBookRecovery,
   createLLMClient,
   createLogger,
   createInteractionToolsFromDeps,
@@ -2815,7 +2820,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
 
   app.get("/api/v1/books", async (c) => {
     const bookIds = await state.listBooks();
-    const books = await Promise.all(bookIds.map((id) => loadStudioBookListSummary(state, id)));
+    const books = await Promise.all(bookIds.map(async id => {
+      try { return await loadStudioBookListSummary(state, id); }
+      catch (error) {
+        const reasonCode = ["TRANSACTION_RECOVERY_REQUIRED", "BOOK_VIEW_CHANGED", "BOOK_BUSY"].find(code => String(error).includes(code) || (error as { code?: string }).code === code);
+        if (!reasonCode) throw error;
+        return { id, title: id, status: "paused", genre: "", chaptersWritten: 0, targetChapters: 0, recoveryRequired: true, reasonCode };
+      }
+    }));
     return c.json({ books });
   });
 
@@ -2826,8 +2838,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       const chapters = await state.loadChapterIndex(id);
       const nextChapter = await state.getNextChapterNumber(id);
       return c.json({ book, chapters, nextChapter });
-    } catch {
-      return c.json({ error: `Book "${id}" not found` }, 404);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      const message = String(error);
+      const reasonCode = ["TRANSACTION_RECOVERY_REQUIRED", "BOOK_VIEW_CHANGED", "BOOK_BUSY"].find(value => code === value || message.includes(value));
+      if (reasonCode) return c.json({ error: message, reasonCode }, 409);
+      const bookExists = await stat(state.bookDir(id)).then(() => true, (failure: NodeJS.ErrnoException) => {
+        if (failure.code === "ENOENT") return false;
+        throw failure;
+      });
+      if (!bookExists) return c.json({ error: `Book "${id}" not found` }, 404);
+      return c.json({ error: message, reasonCode: code ?? "BOOK_READ_FAILED" }, 500);
     }
   });
 
@@ -3395,6 +3416,122 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       return c.json(await pipeline.composeChapter(id, body.context));
     } catch (e) {
       return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/recover-transaction", async (c) => {
+    try {
+      c.req.raw.signal.throwIfAborted();
+      const result = await state.recoverPendingTransaction(c.req.param("id"));
+      broadcast("recovery:transaction-result", { bookId: c.req.param("id"), ...result });
+      return c.json(result);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      const reasonCode = code ?? (String(error).includes("TRANSACTION_RECOVERY_REQUIRED") ? "TRANSACTION_RECOVERY_REQUIRED" : "TRANSACTION_RECOVERY_FAILED");
+      return c.json({ status: "failed", reasonCode, error: String(error) }, code === "BOOK_BUSY" ? 409 : code === "ENOENT" ? 404 : 422);
+    }
+  });
+
+  app.get("/api/v1/books/:id/recovery-status", async (c) => {
+    const target = c.req.query("target");
+    if (target !== undefined && (!/^[1-9]\d*$/.test(target) || !Number.isSafeInteger(Number(target)))) {
+      return c.json({ reasonCode: "INVALID_RECOVERY_TARGET", error: "Chapter must be a positive integer / 章节必须为正整数" }, 400);
+    }
+    try {
+      const health = await inspectBookHealth(state.bookDir(c.req.param("id")));
+      const candidates = await listRecoveryCandidates(state.bookDir(c.req.param("id")));
+      const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(state.bookDir(c.req.param("id")));
+      return c.json({ health, candidates, availableBaselineBackup, ...(target === undefined ? {} : { plan: planBookRecovery(health, Number(target)) }) });
+    } catch (error) { return c.json({ error: String(error) }, 500); }
+  });
+
+  app.post("/api/v1/books/:id/restore-baseline/:backupId", async (c) => {
+    const id = c.req.param("id");
+    const backupId = c.req.param("backupId");
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(backupId)) return c.json({ error: "Invalid recovery backup ID" }, 400);
+    try {
+      await state.restoreRecoveryBaseline(id, backupId);
+      const health = await inspectBookHealth(state.bookDir(id));
+      broadcast("recovery:baseline-restored", { bookId: id, backupId });
+      return c.json({ status: "applied", backupId, health });
+    } catch (error) {
+      const reasonCode = (error as { code?: string }).code;
+      return c.json({ status: "failed", reasonCode, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : 422);
+    }
+  });
+
+  app.post("/api/v1/books/:id/recover/:chapter", async (c) => {
+    const id = c.req.param("id");
+    const target = c.req.param("chapter");
+    if (!/^[1-9]\d*$/.test(target) || !Number.isSafeInteger(Number(target))) {
+      return c.json({ reasonCode: "INVALID_RECOVERY_TARGET", error: "Chapter must be a positive integer / 章节必须为正整数" }, 400);
+    }
+    let body: { dryRun?: boolean } = {};
+    try {
+      const text = await c.req.text();
+      body = text ? JSON.parse(text) : {};
+      if (!body || typeof body !== "object" || Array.isArray(body) || (body.dryRun !== undefined && typeof body.dryRun !== "boolean")) throw new Error("Invalid dryRun");
+    } catch { return c.json({ error: "Invalid recovery request / 恢复请求格式错误" }, 400); }
+    try {
+      if (body.dryRun) {
+        const health = await inspectBookHealth(state.bookDir(id));
+        const plan = planBookRecovery(health, Number(target));
+        return c.json({ health, plan }, plan.blockedReason ? 409 : 200);
+      }
+      const pipeline = new PipelineRunner(await buildPipelineConfig({ bookIdForSettings: id }));
+      const result = await pipeline.runWithAbortSignal(c.req.raw.signal, () => pipeline.recoverChapters(id, Number(target)));
+      const status = result.status === "blocked" ? 409 : result.status === "failed" || result.status === "cancelled" ? 422 : 200;
+      broadcast("recovery:result", { bookId: id, ...result });
+      return c.json(result, status);
+    } catch (error) {
+      const failure = error as { code?: string; reasonCode?: string; candidateId?: string; stage?: string; name?: string };
+      const reasonCode = failure.reasonCode ?? failure.code;
+      const cancelled = failure.name === "AbortError" || c.req.raw.signal.aborted;
+      return c.json({ status: cancelled ? "cancelled" : "failed", reasonCode, candidateId: failure.candidateId, stage: failure.stage, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : cancelled ? 422 : 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/discard-candidate/:candidateId", async (c) => {
+    const id = c.req.param("id");
+    const candidateId = c.req.param("candidateId");
+    if (!/^[a-zA-Z0-9_-]+$/.test(candidateId)) return c.json({ error: "Invalid candidate ID" }, 400);
+    try {
+      c.req.raw.signal.throwIfAborted();
+      const release = await state.acquireBookLock(id);
+      try { await discardRecoveryCandidate(state.bookDir(id), candidateId); }
+      finally { await release(); }
+      return c.json({ status: "discarded", candidateId, preservesBodies: true });
+    } catch (error) {
+      const reasonCode = (error as { code?: string }).code;
+      return c.json({ status: "failed", candidateId, reasonCode, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/resume-candidate/:candidateId", async (c) => {
+    const id = c.req.param("id");
+    const candidateId = c.req.param("candidateId");
+    if (!/^[a-zA-Z0-9_-]+$/.test(candidateId)) return c.json({ error: "Invalid candidate ID" }, 400);
+    let options: { legacyRevisionGate?: "strict" | "lenient" | "always" } = {};
+    try {
+      const text = await c.req.text();
+      const body: unknown = text ? JSON.parse(text) : {};
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Invalid candidate policy");
+      const gate = (body as Record<string, unknown>).legacyRevisionGate;
+      if (gate !== undefined && gate !== "strict" && gate !== "lenient" && gate !== "always") throw new Error("Invalid candidate policy");
+      if (gate) options = { legacyRevisionGate: gate };
+    } catch { return c.json({ reasonCode: "INVALID_CANDIDATE_POLICY", error: "Invalid candidate policy" }, 400); }
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig({ bookIdForSettings: id }));
+      const result = await pipeline.runWithAbortSignal(c.req.raw.signal, () => options.legacyRevisionGate
+        ? pipeline.resumeRevisionCandidate(id, candidateId, options)
+        : pipeline.resumeRevisionCandidate(id, candidateId));
+      broadcast("recovery:candidate-result", { bookId: id, ...result });
+      return c.json(result, result.applied ? 200 : 422);
+    } catch (error) {
+      const failure = error as { code?: string; reasonCode?: string; candidateId?: string; stage?: string; name?: string };
+      const reasonCode = failure.reasonCode ?? failure.code;
+      const cancelled = failure.name === "AbortError" || c.req.raw.signal.aborted;
+      return c.json({ status: cancelled ? "cancelled" : "failed", reasonCode, candidateId: failure.candidateId ?? candidateId, stage: failure.stage, error: String(error) }, reasonCode === "BOOK_BUSY" ? 409 : cancelled ? 422 : 500);
     }
   });
 
@@ -4699,11 +4836,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         bookSession = updatedSession;
       }
       let activeBookConfig: { readonly language?: string } | null = null;
+      let recoveryOnly = false;
       if (agentBookId && sessionKind !== "interactive-film-authoring") {
         try {
           activeBookConfig = await state.loadBookConfig(agentBookId);
-        } catch {
-          throw new ApiError(404, "BOOK_NOT_FOUND", `Book not found: ${agentBookId}`);
+        } catch (error) {
+          if (["TRANSACTION_RECOVERY_REQUIRED", "BOOK_VIEW_CHANGED", "BOOK_BUSY"].some(code => String(error).includes(code) || (error as { code?: string }).code === code)) recoveryOnly = true;
+          else throw new ApiError(404, "BOOK_NOT_FOUND", `Book not found: ${agentBookId}`);
         }
       }
       const configLanguage = config.language === "en" ? "en" : "zh";
@@ -5060,6 +5199,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           apiKey: agentApiKey,
           runtime: pipelineClient.defaults,
           pipeline,
+          recoveryOnly,
           ...(backgroundTask
             ? {
                 backgroundTaskContext: buildRunningTaskContextBlock(backgroundTask, surfaceLanguage),

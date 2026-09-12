@@ -10,6 +10,9 @@ const runRadarMock = vi.fn();
 const planChapterMock = vi.fn();
 const composeChapterMock = vi.fn();
 const repairChapterStateMock = vi.fn();
+const recoverChaptersMock = vi.fn();
+const resumeRevisionCandidateMock = vi.fn();
+const discardRecoveryCandidateMock = vi.fn();
 const reviseFoundationMock = vi.fn();
 const initSpinoffBookMock = vi.fn();
 const initImitationBookMock = vi.fn();
@@ -235,6 +238,10 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
       return async () => undefined;
     }
 
+    async restoreRecoveryBaseline(bookId: string, backupId: string): Promise<void> {
+      await new actual.StateManager(this.root).restoreRecoveryBaseline(bookId, backupId);
+    }
+
     async getNextChapterNumber(_bookId?: string): Promise<number> {
       return 1;
     }
@@ -263,6 +270,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
       context.signal?.throwIfAborted();
       return task();
     });
+    runWithAbortSignal = (signal: AbortSignal | undefined, task: () => Promise<unknown>) => this.runWithAgentContext({ signal }, task);
 
     createAgentContext = vi.fn(() => ({}));
 
@@ -271,6 +279,8 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     planChapter = planChapterMock;
     composeChapter = composeChapterMock;
     repairChapterState = repairChapterStateMock;
+    recoverChapters = recoverChaptersMock;
+    resumeRevisionCandidate = resumeRevisionCandidateMock;
     reviseFoundation = reviseFoundationMock;
     initSpinoffBook = initSpinoffBookMock;
     initImitationBook = initImitationBookMock;
@@ -317,6 +327,11 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
   return {
     StateManager: MockStateManager,
     PipelineRunner: MockPipelineRunner,
+    inspectBookHealth: actual.inspectBookHealth,
+    listRecoveryCandidates: actual.listRecoveryCandidates,
+    discardRecoveryCandidate: discardRecoveryCandidateMock,
+    findRecoveryBaseline: actual.findRecoveryBaseline,
+    planBookRecovery: actual.planBookRecovery,
     Scheduler: MockScheduler,
     createLLMClient: createLLMClientMock,
     createLogger: vi.fn(() => logger),
@@ -498,6 +513,9 @@ describe("createStudioServer daemon lifecycle", () => {
     planChapterMock.mockReset();
     composeChapterMock.mockReset();
     repairChapterStateMock.mockReset();
+    recoverChaptersMock.mockReset();
+    resumeRevisionCandidateMock.mockReset();
+    discardRecoveryCandidateMock.mockReset();
     reviseFoundationMock.mockReset();
     initSpinoffBookMock.mockReset();
     initImitationBookMock.mockReset();
@@ -6519,6 +6537,117 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(raw.llm.service).toBe("kkaiapi");
     expect(raw.llm.defaultModel).toBe("deepseek-v4-flash");
     expect(raw.llm.model).toBe("deepseek-v4-flash");
+  });
+
+  it("recovery status and dry run inspect real snapshots without model construction", async () => {
+    const book = join(root, "books/demo-book");
+    await mkdir(join(book, "story/snapshots/0"), { recursive: true });
+    for (const name of ["current_state.md", "pending_hooks.md"]) await writeFile(join(book, "story/snapshots/0", name), "initial", "utf8");
+    await writeFile(join(book, "chapters/0001_fixture.md"), "preserved", "utf8");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const count = pipelineConfigs.length;
+    const status = await app.request("http://localhost/api/v1/books/demo-book/recovery-status?target=1");
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ health: { stateFrontier: 0 }, plan: { steps: [{ chapter: 1 }] } });
+    const dryRun = await app.request("http://localhost/api/v1/books/demo-book/recover/1", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dryRun: true }),
+    });
+    expect(dryRun.status).toBe(200);
+    expect(await dryRun.json()).toMatchObject({ plan: { preservesBodies: true } });
+    expect(pipelineConfigs).toHaveLength(count);
+    expect(recoverChaptersMock).not.toHaveBeenCalled();
+    expect(await readFile(join(book, "chapters/0001_fixture.md"), "utf8")).toBe("preserved");
+  });
+
+  it("recovery can explicitly restore a verified baseline backup without changing chapter bodies", async () => {
+    const actual = await vi.importActual<typeof import("@actalk/inkos-core")>("@actalk/inkos-core");
+    const manager = new actual.StateManager(root);
+    const book = join(root, "books/demo-book");
+    await mkdir(join(book, "story"), { recursive: true });
+    for (const name of ["current_state.md", "pending_hooks.md"]) await writeFile(join(book, "story", name), "initial", "utf8");
+    await manager.snapshotState("demo-book", 0);
+    const release = await manager.acquireBookLock("demo-book");
+    try { await manager.publishBookMutation("demo-book", () => rm(join(book, "story/snapshots/0"), { recursive: true })); }
+    finally { await release(); }
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const status = await app.request("http://localhost/api/v1/books/demo-book/recovery-status");
+    const result = await status.json() as { availableBaselineBackup: { backupId: string } };
+    expect(result.availableBaselineBackup?.backupId).toBeTruthy();
+    const response = await app.request(`http://localhost/api/v1/books/demo-book/restore-baseline/${result.availableBaselineBackup.backupId}`, { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await readFile(join(book, "story/snapshots/0/current_state.md"), "utf8")).toBe("initial");
+    expect(await readFile(join(book, "chapters/0003_Demo.md"), "utf8")).toBe("# Demo\n\nBody");
+  });
+
+  it("recovery execution reports blocked and failed outcomes through HTTP", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    recoverChaptersMock.mockResolvedValue({ status: "blocked", reasonCode: "BASELINE_MISSING", completed: [] });
+    const blocked = await app.request("http://localhost/api/v1/books/demo-book/recover/1", { method: "POST" });
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({ reasonCode: "BASELINE_MISSING" });
+    recoverChaptersMock.mockResolvedValue({ status: "failed", error: "settlement failed", completed: [] });
+    expect((await app.request("http://localhost/api/v1/books/demo-book/recover/1", { method: "POST" })).status).toBe(422);
+    expect(recoverChaptersMock).toHaveBeenCalledWith("demo-book", 1);
+  });
+
+  it("recovery propagates request cancellation and preserves candidate error metadata", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const aborted = new AbortController();
+    aborted.abort();
+    await app.request(new Request("http://localhost/api/v1/books/demo-book/recover/1", { method: "POST", signal: aborted.signal }));
+    expect(recoverChaptersMock).not.toHaveBeenCalled();
+    expect(pipelineAbortSignals.at(-1)?.aborted).toBe(true);
+    resumeRevisionCandidateMock.mockRejectedValue(Object.assign(new Error("validator parse failed"), { candidateId: "candidate-1", reasonCode: "CANDIDATE_VALIDATION_FAILED", stage: "validation" }));
+    const response = await app.request("http://localhost/api/v1/books/demo-book/resume-candidate/candidate-1", { method: "POST" });
+    expect(await response.json()).toMatchObject({ candidateId: "candidate-1", reasonCode: "CANDIDATE_VALIDATION_FAILED", stage: "validation" });
+  });
+
+  it("recovery validates its target and resumes the exact candidate", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    expect((await app.request("http://localhost/api/v1/books/demo-book/recover/1junk", { method: "POST" })).status).toBe(400);
+    resumeRevisionCandidateMock.mockResolvedValue({ applied: false, candidateId: "candidate-1" });
+    const resumed = await app.request("http://localhost/api/v1/books/demo-book/resume-candidate/candidate-1", { method: "POST" });
+    expect(resumed.status).toBe(422);
+    expect(resumeRevisionCandidateMock).toHaveBeenCalledWith("demo-book", "candidate-1");
+  });
+  it("keeps active-book chat reachable in recovery-only mode", async () => {
+    loadBookConfigMock.mockRejectedValue(Object.assign(new Error("TRANSACTION_RECOVERY_REQUIRED"), { code: "TRANSACTION_RECOVERY_REQUIRED" }));
+    runAgentSessionMock.mockResolvedValue({ responseText: "Recovery available", messages: [] });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction: "recover", activeBookId: "demo-book", sessionId: "agent-session-1" }),
+    });
+    expect(response.status).toBe(200);
+    expect(runAgentSessionMock.mock.calls.at(-1)?.[0]).toMatchObject({ bookId: "demo-book", recoveryOnly: true });
+  });
+  it("validates and forwards only explicit legacy candidate policy", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    resumeRevisionCandidateMock.mockResolvedValue({ applied: true });
+    const request = (legacyRevisionGate: string) => app.request("http://localhost/api/v1/books/demo-book/resume-candidate/candidate-1", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ legacyRevisionGate }),
+    });
+    expect((await request("invalid")).status).toBe(400);
+    expect(resumeRevisionCandidateMock).not.toHaveBeenCalled();
+    expect((await request("always")).status).toBe(200);
+    expect(resumeRevisionCandidateMock).toHaveBeenCalledWith("demo-book", "candidate-1", { legacyRevisionGate: "always" });
+  });
+  it("discards a named recovery candidate without constructing a model pipeline", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const before = pipelineConfigs.length;
+    const response = await app.request("http://localhost/api/v1/books/demo-book/discard-candidate/candidate-1", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "discarded", candidateId: "candidate-1", preservesBodies: true });
+    expect(discardRecoveryCandidateMock).toHaveBeenCalledWith(join(root, "books", "demo-book"), "candidate-1");
+    expect(pipelineConfigs).toHaveLength(before);
   });
 
   it("project advanced settings expose detection config", async () => {

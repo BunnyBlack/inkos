@@ -20,6 +20,10 @@ import {
   createPatchChapterTextTool,
   createReplaceChapterTextTool,
   createResyncChapterStateTool,
+  createRecoveryStatusTool,
+  createRecoverTransactionTool,
+  createRecoverChaptersTool,
+  createResumeRevisionCandidateTool,
   createDeleteLatestChapterTool,
   createRenameEntityTool,
   createSubAgentTool,
@@ -149,6 +153,7 @@ export interface AgentSessionConfig {
    * Changing this value evicts the cached Agent so the tool table stays current.
    */
   suppressProductionTools?: boolean;
+  recoveryOnly?: boolean;
 }
 
 export interface AgentSessionResult {
@@ -309,6 +314,7 @@ interface CachedAgent {
   allowSystemFileRead: boolean;
   backgroundTaskContext: string | undefined;
   suppressProductionTools: boolean;
+  recoveryOnly: boolean;
   currentAttachmentPaths: string[];
   lastCommittedSeq: number;
   lastActive: number;
@@ -872,6 +878,9 @@ const PRODUCTION_MUTATION_TOOL_NAMES = new Set([
   "patch_chapter_text",
   "replace_chapter_text",
   "resync_chapter_state",
+  "recover_chapters",
+  "recover_transaction",
+  "resume_revision_candidate",
   "delete_latest_chapter",
   "import_chapters",
   "fanfic_create",
@@ -1085,6 +1094,10 @@ function createModeTools(params: CreateAgentToolsForModeParams) {
 
   const bookTools = [
     subAgentTool,
+    createRecoveryStatusTool(params.pipeline, params.bookId),
+    createRecoverTransactionTool(params.projectRoot, params.bookId),
+    createRecoverChaptersTool(params.pipeline, params.bookId),
+    createResumeRevisionCandidateTool(params.pipeline, params.bookId),
     createGenerateCoverTool(params.projectRoot, { actionPayload: params.actionPayload }),
     createReadTool(params.projectRoot, { allowSystemPaths: params.allowSystemFileRead }),
     createWriteTruthFileTool(params.pipeline, params.projectRoot, params.bookId),
@@ -1172,6 +1185,7 @@ async function runAgentSessionUnlocked(
   const requestedModelIdentity = agentModelIdentity(model, config.runtime);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
   const suppressProductionTools = config.suppressProductionTools ?? false;
+  const recoveryOnly = config.recoveryOnly ?? false;
   const playWorldExists = sessionKind === "play"
     ? Boolean(await new PlayStore(projectRoot).loadWorld(sessionId))
     : false;
@@ -1217,7 +1231,7 @@ async function runAgentSessionUnlocked(
       readPermissionChanged ||
       playWorldChanged ||
       backgroundTaskContextChanged ||
-      suppressProductionToolsChanged ||
+      suppressProductionToolsChanged || cached.recoveryOnly !== recoveryOnly ||
       transcriptChanged
     ) {
       agentCache.delete(cacheKey);
@@ -1307,12 +1321,18 @@ async function runAgentSessionUnlocked(
         systemPrompt: config.backgroundTaskContext
           ? `${baseSystemPrompt}\n\n${config.backgroundTaskContext}`
           : baseSystemPrompt,
-        tools: suppressProductionTools
-          ? agentTools.filter((tool) => !PRODUCTION_MUTATION_TOOL_NAMES.has(tool.name))
-          : agentTools,
+        tools: agentTools
+          .filter(tool => !recoveryOnly || ["recovery_status", "recover_transaction"].includes(tool.name))
+          .filter(tool => !suppressProductionTools || !PRODUCTION_MUTATION_TOOL_NAMES.has(tool.name))
+          .map((tool) => ({
+              ...tool,
+              execute: async (...args: Parameters<typeof tool.execute>) => {
+                return loopGuard.executeTool(tool.name, args[0], args[1] as Record<string, unknown>, () => tool.execute(...args));
+              },
+            })),
         messages: initialAgentMessages,
       },
-      transformContext: sessionKind === "interactive-film-authoring" && bookId
+      transformContext: recoveryOnly ? async messages => messages : sessionKind === "interactive-film-authoring" && bookId
         ? createInteractiveFilmContextTransform(bookId, projectRoot)
         : createBookContextTransform(bookId, projectRoot, { onContextCompression }),
       convertToLlm: (messages) => {
@@ -1354,6 +1374,7 @@ async function runAgentSessionUnlocked(
       allowSystemFileRead,
       backgroundTaskContext: config.backgroundTaskContext,
       suppressProductionTools,
+      recoveryOnly,
       currentAttachmentPaths: (config.attachments ?? [])
         .map((attachment) => attachment.storedPath?.trim())
         .filter((path): path is string => Boolean(path)),

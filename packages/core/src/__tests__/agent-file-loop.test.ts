@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeFileSync } from "node:fs";
@@ -98,6 +98,48 @@ describe("file tools and conversational loop recovery", () => {
     expect(results.map((m: any) => m.isError)).toEqual([true, false]);
     expect(result.responseText).toBe("Recovered.");
     expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("blocks rejected-revision fallback writes in the same model response", async () => {
+    await mkdir(join(root, "books", "sample", "story"), { recursive: true });
+    const hooks = join(root, "books", "sample", "story", "pending_hooks.md");
+    await writeFile(hooks, "original", "utf8");
+    const reviseDraft = vi.fn(async () => ({ applied: false, status: "unchanged", chapterNumber: 1, fixedIssues: [], wordCount: 10 }));
+    const pipeline = { reviseDraft, runWithAgentContext: (_context: unknown, task: () => unknown) => task() } as any;
+    transport.reply = (i) => i === 0 ? [
+      ...call(0, "sub_agent", { agent: "reviser", chapterNumber: 1, instruction: "Revise the scene." }),
+      ...call(1, "write_truth_file", { fileName: "pending_hooks.md", content: "bypass" }),
+    ] : [{ type: "text", text: "Recovery required." }];
+    const result = await runAgentSession({ ...config(), pipeline }, "Revise chapter one.");
+    expect(reviseDraft).toHaveBeenCalledTimes(1);
+    expect(await readFile(hooks, "utf8")).toBe("original");
+    expect(result.messages.some((m: any) => m.role === "toolResult" && m.toolName === "write_truth_file" && m.isError)).toBe(true);
+  });
+
+  it("stops a third reworded production call at execute within one response", async () => {
+    const reviseDraft = vi.fn(async () => ({ applied: false, status: "unchanged", chapterNumber: 1, fixedIssues: [], wordCount: 10 }));
+    const pipeline = { reviseDraft, runWithAgentContext: (_context: unknown, task: () => unknown) => task() } as any;
+    transport.reply = () => [0, 1, 2].flatMap((i) => call(i, "sub_agent", { agent: "reviser", chapterNumber: 1, instruction: `New wording ${i}.` }));
+    const result = await runAgentSession({ ...config(), pipeline }, "Revise chapter one.");
+    expect(reviseDraft).toHaveBeenCalledTimes(2);
+    expect(result.errorMessage).toMatch(/loop guard/i);
+  });
+
+  it("shares the failed-production budget with recovery and candidate-resume tools", async () => {
+    const reviseDraft = vi.fn(async () => ({ applied: false, status: "unchanged", chapterNumber: 1, candidateId: "candidate-one", fixedIssues: [], wordCount: 10 }));
+    const recoverChapters = vi.fn(async () => ({ status: "failed", completed: [], plan: { preservesBodies: true } }));
+    const resumeRevisionCandidate = vi.fn(async () => ({ applied: true, chapterNumber: 1 }));
+    const pipeline = { reviseDraft, recoverChapters, resumeRevisionCandidate, runWithAgentContext: (_context: unknown, task: () => unknown) => task() } as any;
+    transport.reply = () => [
+      ...call(0, "sub_agent", { agent: "reviser", chapterNumber: 1, instruction: "Revise." }),
+      ...call(1, "recover_chapters", { targetChapter: 1 }),
+      ...call(2, "resume_revision_candidate", { candidateId: "candidate-one" }),
+    ];
+    const result = await runAgentSession({ ...config(), pipeline }, "Repair chapter one.");
+    expect(reviseDraft).toHaveBeenCalledTimes(1);
+    expect(recoverChapters).toHaveBeenCalledTimes(1);
+    expect(resumeRevisionCandidate).not.toHaveBeenCalled();
+    expect(result.errorMessage).toMatch(/loop guard/i);
   });
 
   it("stops repeated schema failures before another model request", async () => {

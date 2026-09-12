@@ -711,11 +711,11 @@ describe("CLI integration", () => {
         env: failingLlmEnv,
       });
       expect(exitCode).not.toBe(0);
-      expect(`${stdout}\n${stderr}`).toContain("missing snapshot for chapter 1");
+      expect(`${stdout}\n${stderr}`).toContain("Cannot restore snapshot for chapter 1");
       await expect(readFile(join(chaptersDir, "0002_ch2.md"), "utf-8")).resolves.toContain("Content 2");
     });
 
-    it("keeps next chapter at 2 after rewrite 2 trims later chapters, even if regeneration fails", async () => {
+    it("restores all original chapters when rewrite regeneration fails", async () => {
       const state = new StateManager(projectDir);
       const bookId = "rewrite-cli";
       const bookDir = join(projectDir, "books", bookId);
@@ -742,6 +742,7 @@ describe("CLI integration", () => {
       );
       await writeFile(join(storyDir, "current_state.md"), "State at ch1", "utf-8");
       await writeFile(join(storyDir, "pending_hooks.md"), "Hooks at ch1", "utf-8");
+      await state.snapshotState(bookId, 0);
       await writeFile(join(chaptersDir, "0001_ch1.md"), "# Chapter 1\n\nContent 1", "utf-8");
       await writeFile(join(chaptersDir, "0002_ch2.md"), "# Chapter 2\n\nContent 2", "utf-8");
       await writeFile(join(chaptersDir, "0003_ch3.md"), "# Chapter 3\n\nContent 3", "utf-8");
@@ -777,9 +778,14 @@ describe("CLI integration", () => {
       expect(`${stdout}\n${stderr}`).toContain("Regenerating chapter 2");
       expect(`${stdout}\n${stderr}`).not.toContain("resolved to 3");
 
+      // Verify the restored bytes before getNextChapterNumber normalizes legacy progress.
+      expect(JSON.parse(await readFile(join(stateDir, "manifest.json"), "utf8")).lastAppliedChapter).toBe(4);
       const next = await state.getNextChapterNumber(bookId);
-      expect(next).toBe(2);
-      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("State at ch1");
+      expect(next).toBe(4);
+      await expect(readFile(join(chaptersDir, "0002_ch2.md"), "utf8")).resolves.toBe("# Chapter 2\n\nContent 2");
+      await expect(readFile(join(chaptersDir, "0003_ch3.md"), "utf8")).resolves.toBe("# Chapter 3\n\nContent 3");
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("State at ch3");
+      expect(JSON.parse(await readFile(join(stateDir, "current_state.json"), "utf8"))).toEqual({ chapter: 3, facts: [] });
     });
   });
 

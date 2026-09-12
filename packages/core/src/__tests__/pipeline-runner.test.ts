@@ -243,6 +243,17 @@ function createStateCard(params: {
   ].join("\n");
 }
 
+async function snapshotPersistedTestPrefix(state: StateManager, bookId: string): Promise<void> {
+  const path = join(state.bookDir(bookId), "story", "current_state.md");
+  const original = await readFile(path, "utf-8");
+  try {
+    for (const chapter of await state.loadChapterIndex(bookId)) {
+      await writeFile(path, original.replace(/\| Current Chapter \| \d+ \|/, `| Current Chapter | ${chapter.number} |`), "utf-8");
+      await state.snapshotState(bookId, chapter.number);
+    }
+  } finally { await writeFile(path, original, "utf-8"); }
+}
+
 function createCaptureLogger() {
   const infos: string[] = [];
   const warnings: string[] = [];
@@ -291,6 +302,8 @@ async function createRunnerFixture(
   await state.saveBookConfig(bookId, book);
   await mkdir(join(state.bookDir(bookId), "story"), { recursive: true });
   await mkdir(join(state.bookDir(bookId), "chapters"), { recursive: true });
+  // Match initialized production books: even chapter one requires snapshot zero.
+  await snapshotRevisionBaseline(state, bookId, 0);
 
   const runner = new PipelineRunner({
     client: {
@@ -2854,6 +2867,46 @@ describe("PipelineRunner", () => {
     }
   });
 
+  it.each([false, true])("ordered recovery reconciles a partial index and preserves retained prose, settlement failure=%s", async fail => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "First", status: "ready-for-review", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      await writeFile(join(bookDir, "chapters", "0001_First.md"), "First body", "utf8");
+      await state.snapshotState(bookId, 1);
+      const path = join(bookDir, "chapters", "2-retained.md");
+      const prose = "# Retained\r\n\r\nExact retained body.\r\n";
+      await writeFile(path, prose, "utf8");
+      const settle = vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async input => {
+        if (fail) throw new Error("injected settlement failure");
+        return createWriterOutput({ chapterNumber: input.chapterNumber, title: input.title, content: input.content,
+          updatedState: "settled second chapter", updatedHooks: "settled hooks" });
+      });
+      const result = await runner.recoverChapters(bookId, 2);
+      expect(result.plan.steps.map(step => step.chapter)).toEqual([2]);
+      expect(result.addedChapters).toEqual([2]);
+      expect(result.status).toBe(fail ? "failed" : "applied");
+      expect(await readFile(path, "utf8")).toBe(prose);
+      const rows = await state.loadChapterIndex(bookId);
+      expect(rows[1]?.stateIntegrity?.status).toBe(fail ? "stale" : "valid");
+      if (!fail) {
+        expect(await readFile(join(bookDir, "story", "snapshots", "2", "current_state.md"), "utf8")).toBe("settled second chapter");
+        expect((await runner.recoverChapters(bookId, 2)).status).toBe("unchanged");
+        expect(settle).toHaveBeenCalledTimes(1);
+      } else {
+        settle.mockImplementation(async input => createWriterOutput({ chapterNumber: input.chapterNumber,
+          title: input.title, content: input.content, updatedState: "retry second chapter", updatedHooks: "settled hooks" }));
+        const retry = await runner.recoverChapters(bookId, 2);
+        expect(retry.status).toBe("applied");
+        expect(retry.addedChapters).toEqual([]);
+        expect(retry.completed).toEqual([2]);
+        expect(await readFile(path, "utf8")).toBe(prose);
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("blocks continuation when an older chapter only has a legacy degraded review note", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
     try {
@@ -2945,6 +2998,7 @@ describe("PipelineRunner", () => {
       for (const call of validate.mock.calls) expect(call[2]).toBe("baseline zero");
       await expect(readFile(join(bookDir, "chapters", "0002_Chapter.md"), "utf-8")).resolves.toBe("Body 2");
       expect((await state.loadChapterIndex(bookId))[1]?.status).toBe("state-degraded");
+      await expect(readFile(join(bookDir, "chapters", "0001_Chapter.md"), "utf8")).resolves.toBe("Body 1");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -2973,7 +3027,10 @@ describe("PipelineRunner", () => {
       const run = () => operation === "repair" ? runner.repairChapterState(bookId, 1) : runner.resyncChapterArtifacts(bookId, 1);
       await expect(run()).rejects.toThrow("simulated persistence failure");
       const [pending] = await state.loadChapterIndex(bookId);
-      expect(JSON.parse(pending!.reviewNote!).baseStatus).toBe("audit-failed");
+      // Transaction rollback restores the exact legacy metadata; explicit audit
+      // failure still takes precedence when the operation is retried.
+      expect(pending!.status).toBe("audit-failed");
+      expect(JSON.parse(pending!.reviewNote!).baseStatus).toBe("ready-for-review");
       save.mockRestore();
       const result = await run();
       expect(result.status).toBe("audit-failed");
@@ -3061,8 +3118,6 @@ describe("PipelineRunner", () => {
       writeFile(join(storyDir, "current_state.md"), "stable state", "utf-8"),
       writeFile(join(storyDir, "pending_hooks.md"), "stable hooks", "utf-8"),
       writeFile(join(storyDir, "particle_ledger.md"), "stable ledger", "utf-8"),
-      writeFile(join(baselineDir, "current_state.md"), "baseline state", "utf-8"),
-      writeFile(join(baselineDir, "pending_hooks.md"), "baseline hooks", "utf-8"),
       writeFile(
         join(bookDir, "chapters", "0001_Broken_Persistence.md"),
         "# 第1章 Broken Persistence\n\nHealthy chapter body with the copper token in his coat.",
@@ -3156,8 +3211,6 @@ describe("PipelineRunner", () => {
         "| 1 | 夜灯 | 林越 | 林越继续追查师债 | 追查意图更强 | 师债推进 | 压抑 | 主线推进 |",
         "",
       ].join("\n"), "utf-8"),
-      writeFile(join(baselineDir, "current_state.md"), "baseline state", "utf-8"),
-      writeFile(join(baselineDir, "pending_hooks.md"), "baseline hooks", "utf-8"),
       writeFile(
         join(bookDir, "chapters", "0001_夜灯.md"),
         "# 第1章 夜灯\n\n林越推门进去，先停在门槛外听了一息，再去看柜台后那盏没关的灯。",
@@ -3374,7 +3427,7 @@ describe("PipelineRunner", () => {
         wordCount: input.chapterContent.length,
       }),
     );
-    vi.spyOn(WriterAgent.prototype, "saveChapter").mockResolvedValue(undefined);
+    vi.spyOn(WriterAgent.prototype, "saveChapter");
 
     const result = await runner.importChapters({
       bookId,
@@ -3824,7 +3877,7 @@ describe("PipelineRunner", () => {
         wordCount: countChapterLength(input.chapterContent, "en_words"),
       }),
     );
-    vi.spyOn(WriterAgent.prototype, "saveChapter").mockResolvedValue(undefined);
+    vi.spyOn(WriterAgent.prototype, "saveChapter");
 
     const result = await runner.importChapters({
       bookId,
@@ -4359,6 +4412,7 @@ describe("PipelineRunner", () => {
     );
 
     try {
+      await snapshotPersistedTestPrefix(state, bookId);
       const result = await runner.writeNextChapter(bookId);
       const driftFile = await readFile(join(storyDir, "audit_drift.md"), "utf-8");
       const currentState = await readFile(join(storyDir, "current_state.md"), "utf-8");
@@ -4445,6 +4499,7 @@ describe("PipelineRunner", () => {
     );
 
     try {
+      await snapshotPersistedTestPrefix(state, bookId);
       const result = await runner.writeNextChapter(bookId);
       const driftFile = await readFile(join(storyDir, "audit_drift.md"), "utf-8");
       const currentState = await readFile(join(storyDir, "current_state.md"), "utf-8");
@@ -4529,6 +4584,7 @@ describe("PipelineRunner", () => {
     );
 
     try {
+      await snapshotPersistedTestPrefix(state, bookId);
       const result = await runner.writeNextChapter(bookId, 120);
 
       expect(result.auditResult.issues).toEqual(
@@ -4593,6 +4649,7 @@ describe("PipelineRunner", () => {
     );
 
     try {
+      await snapshotPersistedTestPrefix(state, bookId);
       const result = await runner.writeNextChapter(bookId, 120);
       const index = await state.loadChapterIndex(bookId);
 
@@ -4648,6 +4705,7 @@ describe("PipelineRunner", () => {
     );
 
     try {
+      await snapshotPersistedTestPrefix(state, bookId);
       const result = await runner.writeNextChapter(bookId, 120);
       const index = await state.loadChapterIndex(bookId);
 
@@ -5101,6 +5159,53 @@ describe("PipelineRunner", () => {
     suggestion: "压缩一行解释。",
   };
 
+  it("rejects ambiguous retained chapter bodies before revision generation", async () => {
+    const { root, runner, bookId, chaptersDir } = await createRevisionGateFixture("always");
+    try {
+      await writeFile(join(chaptersDir, "1-retained.md"), "Ambiguous original", "utf8");
+      await expect(runner.reviseDraft(bookId, 1)).rejects.toThrow("CHAPTER_BODY_AMBIGUOUS");
+      expect(ReviserAgent.prototype.reviseChapter).not.toHaveBeenCalled();
+      expect(await readFile(join(chaptersDir, "1-retained.md"), "utf8")).toBe("Ambiguous original");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["sync", "revise", "next"])("%s rejects a corrupt predecessor snapshot before generation", async (operation) => {
+    const { root, runner, state, bookId } = await createRevisionGateFixture("always");
+    try {
+      await writeFile(join(state.bookDir(bookId), "story", "snapshots", "0", "current_state.md"), "corrupted baseline", "utf-8");
+      const execute = () => operation === "sync" ? runner.resyncChapterArtifacts(bookId, 1)
+        : operation === "revise" ? runner.reviseDraft(bookId, 1, "rework", "repair")
+          : runner.writeNextChapter(bookId);
+      await expect(execute()).rejects.toThrow("STATE_RECOVERY_REQUIRED");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("sync rejects a stale predecessor body even when its audit status passes", async () => {
+    const { root, runner, state, bookId, chaptersDir } = await createRevisionGateFixture("always");
+    try {
+      await state.snapshotState(bookId, 1);
+      const [first] = await state.loadChapterIndex(bookId);
+      await state.saveChapterIndex(bookId, [first!, { ...first!, number: 2, title: "Second", status: "audit-passed" }]);
+      await writeFile(join(chaptersDir, "0002_Second.md"), "# Second\n\nSecond body", "utf-8");
+      await writeFile(join(chaptersDir, "0001_Test_Chapter.md"), "# First\n\nChanged predecessor", "utf-8");
+      await expect(runner.resyncChapterArtifacts(bookId, 2)).rejects.toThrow("STATE_RECOVERY_REQUIRED");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("preserves a reachable candidate when validator parsing throws", async () => {
+    const { root, runner, state, bookId, chaptersDir } = await createRevisionGateFixture("always");
+    try {
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: false, issues: [CRITICAL_ISSUE], summary: "needs revision" }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockRejectedValue(new Error("State validator returned invalid response"));
+      const before = await readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf8");
+      const error = await runner.reviseDraft(bookId, 1, "rework").catch(error => error);
+      expect(error).toMatchObject({ candidateId: expect.any(String), stage: "validation", reasonCode: "CANDIDATE_VALIDATION_FAILED" });
+      const dir = join(state.bookDir(bookId), "story", "recovery", "candidates", error.candidateId);
+      expect((await readdir(dir)).some(file => file.startsWith("attempt-"))).toBe(true);
+      expect(await readFile(join(chaptersDir, "0001_Test_Chapter.md"), "utf8")).toBe(before);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
   it("keeps chapter and truth files unchanged when revised-body settlement cannot validate", async () => {
     const { root, runner, state, bookId, chaptersDir, revisedBody } = await createRevisionGateFixture("always");
     const storyDir = join(state.bookDir(bookId), "story");
@@ -5132,9 +5237,70 @@ describe("PipelineRunner", () => {
       await expect(readFile(join(storyDir, "pending_hooks.md"), "utf-8")).resolves.toBe(originalHooks);
       expect(originalChapter).not.toContain(revisedBody);
       await expect(listChapterVersions(state.bookDir(bookId), 1)).resolves.toEqual([]);
+      expect(result.candidateId).toBeTruthy();
+      const reviserCalls = vi.mocked(ReviserAgent.prototype.reviseChapter).mock.calls.length;
+      const rulesPath = join(storyDir, "book_rules.md");
+      const rulesBefore = await readFile(rulesPath, "utf-8").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
+      await writeFile(rulesPath, `${rulesBefore ?? ""}\nChanged author control.`, "utf-8");
+      await expect(runner.resumeRevisionCandidate(bookId, result.candidateId!)).rejects.toThrow("CANDIDATE_INPUTS_CHANGED");
+      expect(vi.mocked(ReviserAgent.prototype.reviseChapter).mock.calls.length).toBe(reviserCalls);
+      if (rulesBefore === null) await rm(rulesPath);
+      else await writeFile(rulesPath, rulesBefore, "utf-8");
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, repairRequired: false, warnings: [] });
+      vi.mocked(ContinuityAuditor.prototype.auditChapter).mockResolvedValue(createAuditResult({ passed: true, issues: [], summary: "passed" }));
+      const resumed = await runner.resumeRevisionCandidate(bookId, result.candidateId!);
+      expect(resumed.applied).toBe(true);
+      expect(vi.mocked(ReviserAgent.prototype.reviseChapter).mock.calls.length).toBe(reviserCalls);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it.each(["always", "strict"] as const)("resumes using saved %s policy despite the new runner default", async (gate) => {
+    const { root, runner, bookId } = await createRevisionGateFixture(gate);
+    try {
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, issues: [], summary: "clean" }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: false, repairRequired: true, warnings: [{ category: "state-conflict", description: "invalid settlement" }] });
+      const retained = await runner.reviseDraft(bookId, 1, "rework");
+      expect(retained.applied).toBe(false);
+      expect(retained.candidateId).toBeTruthy();
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, repairRequired: false, warnings: [] });
+      const calls = vi.mocked(ReviserAgent.prototype.reviseChapter).mock.calls.length;
+      const retry = new PipelineRunner({ client: { provider: "openai", apiFormat: "chat", stream: false, defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0 } } as ConstructorParameters<typeof PipelineRunner>[0]["client"], model: "test-model", projectRoot: root, revisionGate: gate === "always" ? "strict" : "always" });
+      if (gate === "always") {
+        vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: false, repairRequired: true, warnings: [{ category: "state-conflict", description: "invalid retry settlement" }] });
+        expect((await retry.resumeRevisionCandidate(bookId, retained.candidateId!)).applied).toBe(false);
+        vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, repairRequired: false, warnings: [] });
+      }
+      const resumed = await retry.resumeRevisionCandidate(bookId, retained.candidateId!);
+      expect(resumed.applied).toBe(gate === "always");
+      expect(vi.mocked(ReviserAgent.prototype.reviseChapter).mock.calls.length).toBe(calls);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
+
+  it("requires legacy policy before model work and retains the explicit selection after failed settlement", async () => {
+    const { root, runner, state, bookId } = await createRevisionGateFixture("strict");
+    try {
+      vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(createAuditResult({ passed: true, issues: [], summary: "clean" }));
+      vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: false, repairRequired: true, warnings: [{ category: "state-conflict", description: "invalid" }] });
+      const retained = await runner.reviseDraft(bookId, 1, "rework");
+      const evidencePath = join(state.bookDir(bookId), "story", "recovery", "candidates", retained.candidateId!, "candidate.json");
+      const legacy = JSON.parse(await readFile(evidencePath, "utf8"));
+      legacy.version = 1;
+      delete legacy.publicationPolicy;
+      const bytes = JSON.stringify(legacy);
+      await writeFile(evidencePath, bytes, "utf8");
+      const auditCalls = vi.mocked(ContinuityAuditor.prototype.auditChapter).mock.calls.length;
+      const settlementCalls = vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length;
+      await expect(runner.resumeRevisionCandidate(bookId, retained.candidateId!)).rejects.toMatchObject({ reasonCode: "CANDIDATE_POLICY_REQUIRED" });
+      expect(vi.mocked(ContinuityAuditor.prototype.auditChapter).mock.calls.length).toBe(auditCalls);
+      expect(vi.mocked(WriterAgent.prototype.settleChapterState).mock.calls.length).toBe(settlementCalls);
+      expect((await runner.resumeRevisionCandidate(bookId, retained.candidateId!, { legacyRevisionGate: "always" })).applied).toBe(false);
+      await expect(runner.resumeRevisionCandidate(bookId, retained.candidateId!, { legacyRevisionGate: "strict" })).rejects.toThrow("CANDIDATE_POLICY_CONFLICT");
+      vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, repairRequired: false, warnings: [] });
+      expect((await runner.resumeRevisionCandidate(bookId, retained.candidateId!)).applied).toBe(true);
+      expect(await readFile(evidencePath, "utf8")).toBe(bytes);
+    } finally { await rm(root, { recursive: true, force: true }); }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
   it("applies a no-improvement manual revision when revisionGate is lenient", async () => {
@@ -5185,6 +5351,9 @@ describe("PipelineRunner", () => {
 
   it("always applies manual revisions when revisionGate is always, even when the audit worsens", async () => {
     const { root, runner, state, bookId, chaptersDir, revisedBody } = await createRevisionGateFixture("always");
+    const { rename } = await import("node:fs/promises");
+    await rename(join(chaptersDir, "0001_Test_Chapter.md"), join(chaptersDir, "1-retained.md"));
+    await writeFile(join(chaptersDir, "10-retained.md"), "Chapter ten stays intact", "utf8");
 
     vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
       .mockResolvedValueOnce(createAuditResult({ passed: false, issues: [GATE_WARNING_ISSUE], summary: "needs revision" }))
@@ -5201,6 +5370,8 @@ describe("PipelineRunner", () => {
 
       expect(result.applied).toBe(true);
       expect(savedChapter).toContain(revisedBody);
+      await expect(readFile(join(chaptersDir, "1-retained.md"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(chaptersDir, "10-retained.md"), "utf8")).toBe("Chapter ten stays intact");
       const versions = await listChapterVersions(state.bookDir(bookId), 1);
       expect(versions).toHaveLength(1);
       await expect(readChapterVersion(state.bookDir(bookId), 1, versions[0]!.id))
@@ -5237,7 +5408,7 @@ describe("PipelineRunner", () => {
     }
   }, SLOW_PIPELINE_TEST_TIMEOUT_MS);
 
-  it("keeps current truth intact and marks downstream chapters when reworking an older chapter", async () => {
+  it("publishes verified middle-chapter truth and invalidates downstream state while retaining bodies", async () => {
     const { root, runner, state, bookId, chaptersDir, revisedBody } = await createRevisionGateFixture("always");
     const storyDir = join(state.bookDir(bookId), "story");
     const latestState = "# Current State\n\nThe second chapter is already complete.";
@@ -5265,7 +5436,6 @@ describe("PipelineRunner", () => {
         lengthWarnings: [],
       },
     ]);
-    const snapshotState = vi.spyOn(state, "snapshotState");
 
     vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
       .mockResolvedValueOnce(createAuditResult({ passed: true, issues: [], summary: "clean" }))
@@ -5283,11 +5453,13 @@ describe("PipelineRunner", () => {
 
       expect(result.applied).toBe(true);
       expect(savedChapter).toContain(revisedBody);
-      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe(latestState);
-      await expect(readFile(join(storyDir, "pending_hooks.md"), "utf-8")).resolves.toBe(latestHooks);
+      const current = await readFile(join(storyDir, "current_state.md"), "utf8");
+      expect(current).not.toBe(latestState);
+      await expect(readFile(join(storyDir, "snapshots", "1", "current_state.md"), "utf8")).resolves.toBe(current);
+      await expect(readFile(join(chaptersDir, "0002_Later_Chapter.md"), "utf8")).resolves.toContain("Later Chapter");
       expect(savedIndex[0]?.status).toBe("ready-for-review");
-      expect(savedIndex[1]?.status).toBe("needs-revision");
-      expect(snapshotState).not.toHaveBeenCalled();
+      expect(savedIndex[1]?.status).toBe("state-degraded");
+      await expect(stat(join(storyDir, "snapshots", "2"))).rejects.toThrow();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

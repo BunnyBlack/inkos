@@ -82,6 +82,9 @@ describe("WriterAgent", () => {
     });
 
     try {
+      await mkdir(join(bookDir, "chapters"), { recursive: true });
+      await writeFile(join(bookDir, "chapters", "2-retained.md"), "Old chapter two", "utf8");
+      await writeFile(join(bookDir, "chapters", "20-retained.md"), "Chapter twenty", "utf8");
       await agent.saveChapter(bookDir, {
         chapterNumber: 2,
         title: "雨夜对账",
@@ -99,6 +102,9 @@ describe("WriterAgent", () => {
         postWriteErrors: [],
         postWriteWarnings: [],
       }, false, "zh");
+
+      await expect(readFile(join(bookDir, "chapters", "2-retained.md"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(bookDir, "chapters", "20-retained.md"), "utf8")).toBe("Chapter twenty");
 
       expect(await readFile(join(bookDir, "chapters", "0002_雨夜对账.md"), "utf-8"))
         .toContain("林秋在雨夜重新核对账本");

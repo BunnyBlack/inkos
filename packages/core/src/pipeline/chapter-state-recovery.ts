@@ -187,8 +187,9 @@ export interface StateDegradedReviewNote {
 }
 
 /** Older audits could overwrite status while leaving the settlement failure in reviewNote. */
-export function isChapterStateDegraded(chapter: Pick<ChapterMeta, "status" | "reviewNote">): boolean {
-  return chapter.status === "state-degraded" || parseStateDegradedReviewNote(chapter.reviewNote) !== null;
+export function isChapterStateDegraded(chapter: Pick<ChapterMeta, "status" | "reviewNote" | "stateIntegrity">): boolean {
+  return chapter.stateIntegrity?.status === "stale" || chapter.stateIntegrity?.status === "degraded"
+    || chapter.status === "state-degraded" || parseStateDegradedReviewNote(chapter.reviewNote) !== null;
 }
 
 export function markChapterStateDegraded(chapter: ChapterMeta): ChapterMeta {
@@ -196,6 +197,7 @@ export function markChapterStateDegraded(chapter: ChapterMeta): ChapterMeta {
   return {
     ...chapter,
     status: "state-degraded",
+    stateIntegrity: { status: "stale" },
     updatedAt: new Date().toISOString(),
     reviewNote: isChapterStateDegraded(chapter)
       ? JSON.stringify({

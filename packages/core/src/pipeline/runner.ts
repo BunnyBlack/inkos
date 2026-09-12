@@ -1,4 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readRecoveryBody } from "../state/recovery-index.js";
+import { afterBookCommit } from "../state/book-transaction.js";
+import { inspectBookHealth } from "../state/book-health.js";
+import { planBookRecovery, type RecoveryPlan } from "./book-recovery.js";
 import type { LLMClient, OnStreamProgress } from "../llm/provider.js";
 import { createLLMClient } from "../llm/provider.js";
 import { runWorkerAgent } from "../agent/worker-agent.js";
@@ -61,7 +65,7 @@ import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
 import { loadPersistedPlan, relativeToBookDir, savePersistedPlan } from "./persisted-governed-plan.js";
 import { selectBookReferenceContext } from "../references/reference-context.js";
 import type { ActivatedSkillGuidance } from "../agent/skill-tool.js";
-import { commitAtomicFileSet } from "../utils/atomic-file-set.js";
+import { markChapterStateDegraded } from "./chapter-state-recovery.js";
 import { toPosixPath } from "../utils/posix-path.js";
 import {
   createProductionRunSnapshot,
@@ -241,6 +245,8 @@ export interface PipelineConfig {
   readonly client: LLMClient;
   readonly model: string;
   readonly projectRoot: string;
+  /** Whole operation deadline; transport cancellation remains cooperative. */
+  readonly operationTimeoutMs?: number;
   readonly defaultLLMConfig?: LLMConfig;
   readonly foundationReviewRetries?: number;
   readonly writingReviewRetries?: number;
@@ -333,6 +339,7 @@ export interface ComposeChapterResult extends PlanChapterResult {
 }
 
 export interface ReviseResult {
+  readonly candidateId?: string;
   readonly chapterNumber: number;
   readonly wordCount: number;
   readonly fixedIssues: ReadonlyArray<string>;
@@ -449,8 +456,12 @@ export class PipelineRunner {
     task: () => Promise<T>,
   ): Promise<T> {
     const current = this.operationContext.getStore();
+    const suppliedSignal = context.signal ?? current?.signal;
+    const timeout = this.config.operationTimeoutMs ?? 30 * 60_000;
+    if (!Number.isSafeInteger(timeout) || timeout <= 0) throw new Error("Invalid operationTimeoutMs");
     const merged = {
-      signal: context.signal ?? current?.signal,
+      signal: current ? suppliedSignal : suppliedSignal
+        ? AbortSignal.any([suppliedSignal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout),
       activatedSkills: context.activatedSkills ?? current?.activatedSkills,
     };
     merged.signal?.throwIfAborted();
@@ -1121,8 +1132,10 @@ export class PipelineRunner {
 
   /** Write a single draft chapter. Saves chapter file + truth files + index + snapshot. */
   async writeDraft(bookId: string, context?: string, wordCount?: number): Promise<DraftResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.writeDraft(bookId, context, wordCount));
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
+      await this.assertNoPendingStateRepair(bookId);
       await this.state.ensureControlDocuments(bookId);
       const book = await this.state.loadBookConfig(bookId);
       const bookDir = this.state.bookDir(bookId);
@@ -1188,6 +1201,8 @@ export class PipelineRunner {
       const resolvedLang = book.language ?? gp.language;
       // Persist the chapter and its complete truth update as one atomic file set.
       this.logStage(stageLanguage, { zh: "落盘草稿与真相文件", en: "persisting draft and truth files" });
+      this.currentAbortSignal()?.throwIfAborted();
+      await this.publishChapterMutation(bookId, async () => {
       await writer.saveChapter(bookDir, draftOutput, gp.numericalSystem, resolvedLang);
       await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, draftOutput);
       await this.syncNarrativeMemoryIndex(bookId);
@@ -1216,8 +1231,9 @@ export class PipelineRunner {
 
       // Snapshot
       this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" });
-      await this.state.snapshotState(bookId, chapterNumber);
+      await this.publishChapterMutation(bookId, () => this.state.snapshotState(bookId, chapterNumber));
       await this.syncCurrentStateFactHistory(bookId, chapterNumber);
+      });
 
       await this.emitWebhook("chapter-complete", bookId, chapterNumber, {
         title: draftOutput.title,
@@ -1340,7 +1356,8 @@ export class PipelineRunner {
           }
         : ch,
     );
-    await this.state.saveChapterIndex(bookId, updated);
+    this.currentAbortSignal()?.throwIfAborted();
+    await this.publishChapterMutation(bookId, () => this.state.saveChapterIndex(bookId, updated));
     const latestChapter = index.length > 0 ? Math.max(...index.map((chapter) => chapter.number)) : targetChapter;
     if (targetChapter === latestChapter && !updated.some(isChapterStateDegraded)) {
       await this.persistAuditDriftGuidance({
@@ -1362,12 +1379,28 @@ export class PipelineRunner {
   }
 
   /** Revise the latest (or specified) chapter based on audit issues. */
-  async reviseDraft(bookId: string, chapterNumber?: number, mode: ReviseMode = DEFAULT_REVISE_MODE, externalContext?: string): Promise<ReviseResult> {
+  async resumeRevisionCandidate(bookId: string, candidateId: string, options?: import("./recovery-candidate.js").ResumeCandidateOptions): Promise<ReviseResult> {
+    const { loadRecoveryCandidate } = await import("./recovery-candidate.js");
+    const candidate = await loadRecoveryCandidate(this.state.bookDir(bookId), candidateId);
+    return this.reviseDraft(bookId, candidate.chapter, candidate.mode, candidate.externalContext, candidateId, options);
+  }
+
+  private publishChapterMutation<T>(bookId: string, publish: () => Promise<T>): Promise<T> {
+    return this.state.publishBookMutation(bookId, publish, this.currentAbortSignal());
+  }
+
+  async reviseDraft(bookId: string, chapterNumber?: number, mode: ReviseMode = DEFAULT_REVISE_MODE, externalContext?: string, resumeCandidateId?: string, resumeOptions?: import("./recovery-candidate.js").ResumeCandidateOptions): Promise<ReviseResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.reviseDraft(bookId, chapterNumber, mode, externalContext, resumeCandidateId, resumeOptions));
+    const { captureCandidateInputs, createRecoveryCandidate, loadRecoveryCandidate, assertCandidateInputs, recordCandidateAttempt, markCandidateApplied, resolveCandidatePublicationPolicy } = await import("./recovery-candidate.js");
     const releaseLock = await this.state.acquireBookLock(bookId);
+    let retainedCandidateId = resumeCandidateId;
+    let retainedChapterNumber = chapterNumber;
+    let candidateStage = "preflight";
     try {
       const book = await this.state.loadBookConfig(bookId);
       const bookDir = this.state.bookDir(bookId);
       const targetChapter = chapterNumber ?? (await this.state.getNextChapterNumber(bookId)) - 1;
+      retainedChapterNumber = targetChapter;
       if (targetChapter < 1) {
         throw new Error(`No chapters to revise for "${bookId}"`);
       }
@@ -1387,6 +1420,7 @@ export class PipelineRunner {
         ? Math.max(...index.map((chapter) => chapter.number))
         : targetChapter;
       const isLatestChapter = targetChapter === latestChapter;
+      await this.assertNoPendingStateRepair(bookId, targetChapter);
 
       // Re-audit to get structured issues (index only stores strings)
       const content = await this.readChapterContent(bookDir, targetChapter);
@@ -1399,6 +1433,14 @@ export class PipelineRunner {
         persistedChapterBrief,
         externalContext ?? this.config.externalContext,
       );
+      const resumedCandidate = resumeCandidateId ? await loadRecoveryCandidate(bookDir, resumeCandidateId) : undefined;
+      if (resumedCandidate) {
+        if (resumedCandidate.chapter !== targetChapter || resumedCandidate.mode !== mode) throw new Error("CANDIDATE_REQUEST_MISMATCH");
+        assertCandidateInputs(resumedCandidate, await captureCandidateInputs(bookDir, targetChapter, effectiveExternalContext));
+      }
+      const revisionGate = resumedCandidate
+        ? (await resolveCandidatePublicationPolicy(bookDir, resumedCandidate, resumeOptions)).revisionGate
+        : this.config.revisionGate ?? "strict";
       const reviseControlInput = await this.createGovernedArtifacts(
         book,
         bookDir,
@@ -1430,6 +1472,7 @@ export class PipelineRunner {
         preRevision.blockingCount === 0
         && preRevision.aiTellCount === 0
         && !explicitRevisionRequested
+        && !resumedCandidate
       ) {
         return {
           chapterNumber: targetChapter,
@@ -1465,7 +1508,9 @@ export class PipelineRunner {
         zh: `修订第${targetChapter}章`,
         en: `revising chapter ${targetChapter}`,
       });
-      const reviseOutput = await reviser.reviseChapter(
+      const candidateInputs = await captureCandidateInputs(bookDir, targetChapter, effectiveExternalContext);
+      if (resumedCandidate) assertCandidateInputs(resumedCandidate, candidateInputs);
+      const reviseOutput = resumedCandidate?.output ?? await reviser.reviseChapter(
         bookDir,
         content,
         targetChapter,
@@ -1488,6 +1533,17 @@ export class PipelineRunner {
       if (reviseOutput.revisedContent.length === 0) {
         throw new Error("Reviser returned empty content");
       }
+      const candidate = resumedCandidate ?? await createRecoveryCandidate(bookDir, {
+        chapter: targetChapter,
+        mode,
+        externalContext: externalContext ?? this.config.externalContext,
+        inputs: candidateInputs,
+        output: reviseOutput,
+        publicationPolicy: { revisionGate },
+      });
+      retainedCandidateId = candidate.candidateId;
+      candidateStage = "settlement";
+      await recordCandidateAttempt(bookDir, candidate.candidateId, "settlement-started", { resumed: Boolean(resumedCandidate) });
       const revisedContent = reviseOutput.revisedContent;
       const revisedCount = countChapterLength(revisedContent, lengthSpec.countingMode);
       const writer = new WriterAgent(this.agentCtxFor("writer", bookId));
@@ -1503,6 +1559,7 @@ export class PipelineRunner {
         contextPackage: reviseControlInput?.composed.contextPackage,
         ruleStack: reviseControlInput?.composed.ruleStack,
       });
+      candidateStage = "validation";
       let stateValidation = await stateValidator.validate(
         revisedContent,
         targetChapter,
@@ -1536,7 +1593,9 @@ export class PipelineRunner {
           logger: this.config.logger,
         });
         if (recovery.kind === "degraded") {
+          await recordCandidateAttempt(bookDir, candidate.candidateId, "validation-rejected", { attempts: 2, issues: recovery.issues });
           return {
+            candidateId: candidate.candidateId,
             chapterNumber: targetChapter,
             wordCount: countChapterLength(content, countingMode),
             fixedIssues: [],
@@ -1564,6 +1623,7 @@ export class PipelineRunner {
         settledRevision = recovery.output;
         stateValidation = recovery.validation;
       }
+      candidateStage = "audit";
       const postRevision = await this.evaluateMergedAudit({
         auditor,
         book,
@@ -1618,7 +1678,6 @@ export class PipelineRunner {
       const criticalDidNotWorsen = effectivePostRevision.criticalCount <= preRevision.criticalCount;
       const aiDidNotWorsen = effectivePostRevision.aiTellCount <= preRevision.aiTellCount;
       const didNotWorsen = blockingDidNotWorsen && criticalDidNotWorsen && aiDidNotWorsen;
-      const revisionGate = this.config.revisionGate ?? "strict";
       const shouldApplyRevision = revisionGate === "always"
         ? true
         : revisionGate === "lenient"
@@ -1649,7 +1708,9 @@ export class PipelineRunner {
       };
 
       if (!shouldApplyRevision) {
+        await recordCandidateAttempt(bookDir, candidate.candidateId, "audit-rejected", revisionDiagnostics);
         return {
+          candidateId: candidate.candidateId,
           chapterNumber: targetChapter,
           wordCount: revisionBaseCount,
           fixedIssues: [],
@@ -1664,36 +1725,27 @@ export class PipelineRunner {
       this.logLengthWarnings(lengthWarnings);
 
       // Save revised chapter file
+      assertCandidateInputs(candidate, await captureCandidateInputs(bookDir, targetChapter, effectiveExternalContext));
       this.logStage(stageLanguage, {
         zh: `落盘第${targetChapter}章修订结果`,
         en: `persisting revision for chapter ${targetChapter}`,
       });
-      const chaptersDir = join(bookDir, "chapters");
-      const files = await readdir(chaptersDir);
-      const paddedNum = String(targetChapter).padStart(4, "0");
-      const existingFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
-      if (!existingFile) {
-        throw new Error(`Chapter ${targetChapter} file not found in ${chaptersDir} (expected filename starting with ${paddedNum})`);
-      }
+      await readRecoveryBody(bookDir, targetChapter);
+      this.currentAbortSignal()?.throwIfAborted();
+      candidateStage = "commit";
+      await this.publishChapterMutation(bookId, async () => {
       await archiveChapterVersion(bookDir, targetChapter, content, "revision");
       const reviseLang = book.language ?? gp.language;
       const reviseHeading = reviseLang === "en"
         ? `# Chapter ${targetChapter}: ${chapterMeta.title}`
         : `# 第${targetChapter}章 ${chapterMeta.title}`;
 
-      // Only the latest chapter owns current truth. Reworking an older chapter
-      // invalidates its descendants, but must not rewind the live story state.
-      if (isLatestChapter) {
-        await writer.saveChapter(bookDir, settledRevision, gp.numericalSystem, reviseLang);
-      } else {
-        await commitAtomicFileSet({
-          rootDir: bookDir,
-          writes: [{
-            relativePath: join("chapters", existingFile),
-            content: `${reviseHeading}\n\n${revisedContent}`,
-          }],
-        });
+      await this.state.invalidateChapterStateFrom(bookId, targetChapter);
+      if (!isLatestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
+        throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for revision.`);
       }
+      await writer.saveChapter(bookDir, settledRevision, gp.numericalSystem, reviseLang);
+      await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, settledRevision);
 
       // Update index
       const downstreamRevisionNotice = language === "en"
@@ -1704,6 +1756,8 @@ export class PipelineRunner {
           return {
               ...ch,
               status: (effectivePostRevision.auditResult.passed ? "ready-for-review" : "audit-failed") as ChapterMeta["status"],
+              reviewNote: undefined,
+              stateIntegrity: { status: "valid" as const },
               wordCount: revisedCount,
               updatedAt: new Date().toISOString(),
               auditIssues: effectivePostRevision.auditResult.issues.map((i) => `[${i.severity}] ${i.description}`),
@@ -1713,8 +1767,7 @@ export class PipelineRunner {
         }
         if (ch.number > targetChapter) {
           return {
-            ...ch,
-            status: "needs-revision" as ChapterMeta["status"],
+            ...markChapterStateDegraded(ch),
             updatedAt: new Date().toISOString(),
             auditIssues: [
               ...(ch.auditIssues ?? []).filter((issue) => !issue.includes("re-review this downstream chapter") && !issue.includes("请重新检查本章与前文")),
@@ -1741,13 +1794,15 @@ export class PipelineRunner {
         zh: `更新第${targetChapter}章索引与快照`,
         en: `updating chapter index and snapshots for chapter ${targetChapter}`,
       });
-      if (isLatestChapter) {
-        await this.state.snapshotState(bookId, targetChapter);
-      }
+      await this.state.snapshotState(bookId, targetChapter);
       await this.syncNarrativeMemoryIndex(bookId);
       if (isLatestChapter) {
         await this.syncCurrentStateFactHistory(bookId, targetChapter);
       }
+      });
+      await markCandidateApplied(bookDir, candidate.candidateId).catch(error => {
+        this.config.logger?.warn(`Candidate receipt could not be saved after committed revision: ${String(error)}`);
+      });
 
       await this.emitWebhook("revision-complete", bookId, targetChapter, {
         wordCount: revisedCount,
@@ -1755,6 +1810,7 @@ export class PipelineRunner {
       });
 
       return {
+        candidateId: candidate.candidateId,
         chapterNumber: targetChapter,
         wordCount: revisedCount,
         fixedIssues: reviseOutput.fixedIssues,
@@ -1766,6 +1822,18 @@ export class PipelineRunner {
         lengthWarnings,
         lengthTelemetry,
       };
+    } catch (error) {
+      if (!retainedCandidateId) throw error;
+      const original = error instanceof Error ? error : new Error(String(error));
+      const reasonCode = (original as Error & { reasonCode?: string; code?: string }).reasonCode
+        ?? (original as Error & { code?: string }).code
+        ?? `CANDIDATE_${candidateStage.toUpperCase()}_FAILED`;
+      await recordCandidateAttempt(this.state.bookDir(bookId), retainedCandidateId, `${candidateStage}-failed`, {
+        reasonCode, error: original.message,
+      }).catch(recordError => this.config.logger?.warn(`Candidate failure evidence could not be saved: ${String(recordError)}`));
+      throw Object.assign(new Error(`${original.message} Candidate preserved: ${retainedCandidateId}; retry with resume-candidate.`, { cause: original }), {
+        name: original.name, candidateId: retainedCandidateId, chapterNumber: retainedChapterNumber, reasonCode, stage: candidateStage,
+      });
     } finally {
       await releaseLock();
     }
@@ -1833,6 +1901,7 @@ export class PipelineRunner {
     temperatureOverride?: number,
     externalContext?: string,
   ): Promise<ChapterPipelineResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.writeNextChapter(bookId, wordCount, temperatureOverride, externalContext));
     this.throwIfOperationAborted();
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
@@ -1879,6 +1948,7 @@ export class PipelineRunner {
   }
 
   async repairChapterState(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.repairChapterState(bookId, chapterNumber));
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
       return await this._repairChapterStateLocked(bookId, chapterNumber);
@@ -1887,7 +1957,70 @@ export class PipelineRunner {
     }
   }
 
+  async getRecoveryStatus(bookId: string, targetChapter?: number) {
+    const { findRecoveryBaseline } = await import("../state/recovery-backup.js");
+    const { listRecoveryCandidates } = await import("./recovery-candidate.js");
+    const health = await inspectBookHealth(this.state.bookDir(bookId));
+    const candidates = await listRecoveryCandidates(this.state.bookDir(bookId));
+    const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(this.state.bookDir(bookId));
+    return { health, candidates, availableBaselineBackup, plan: targetChapter === undefined ? undefined : planBookRecovery(health, targetChapter) };
+  }
+
+  /** Explicit ordered recovery preserves every body and commits each chapter separately. */
+  async recoverChapters(bookId: string, targetChapter: number): Promise<{
+    status: "applied" | "unchanged" | "failed" | "blocked" | "cancelled";
+    completed: number[]; plan: RecoveryPlan; reasonCode?: string; error?: string; failedChapter?: number; addedChapters?: number[];
+  }> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.recoverChapters(bookId, targetChapter));
+    const release = await this.state.acquireBookLock(bookId);
+    const completed: number[] = [];
+    try {
+      const health = await inspectBookHealth(this.state.bookDir(bookId));
+      const plan = planBookRecovery(health, targetChapter);
+      if (plan.blockedReason) return { status: "blocked" as const, reasonCode: plan.blockedReason, completed, plan };
+      let addedChapters: number[] = [];
+      if (plan.steps.length) {
+        try {
+          this.currentAbortSignal()?.throwIfAborted();
+          const { reconcileRecoveryIndex } = await import("../state/recovery-index.js");
+          ({ addedChapters } = await this.publishChapterMutation(bookId, () => reconcileRecoveryIndex(this.state.bookDir(bookId), targetChapter)));
+        } catch (error) {
+          return { status: this.currentAbortSignal()?.aborted ? "cancelled" as const : "failed" as const,
+            reasonCode: (error as { code?: string }).code ?? "CHAPTER_METADATA_RECOVERY_FAILED", error: String(error), completed, plan, addedChapters };
+        }
+      }
+      for (const step of plan.steps) {
+        try {
+          this.currentAbortSignal()?.throwIfAborted();
+          await this._resyncChapterArtifactsLocked(bookId, step.chapter);
+          completed.push(step.chapter);
+        } catch (error) {
+          return { status: this.currentAbortSignal()?.aborted ? "cancelled" as const : "failed" as const,
+            reasonCode: "CHAPTER_RECOVERY_FAILED", error: String(error), failedChapter: step.chapter, completed, plan, addedChapters };
+        }
+      }
+      return { status: completed.length ? "applied" as const : "unchanged" as const, completed, plan, addedChapters };
+    } finally { await release(); }
+  }
+
+  /** Explicit destructive rewrite is one recoverable operation, including generation failure. */
+  async rewriteFromChapter(bookId: string, chapterNumber: number, wordCount?: number): Promise<ChapterPipelineResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.rewriteFromChapter(bookId, chapterNumber, wordCount));
+    if (!Number.isSafeInteger(chapterNumber) || chapterNumber < 1) throw new Error("Invalid rewrite chapter");
+    const release = await this.state.acquireBookLock(bookId);
+    try {
+      return await this.publishChapterMutation(bookId, async () => {
+        await this.state.rollbackToChapter(bookId, chapterNumber - 1);
+        this.currentAbortSignal()?.throwIfAborted();
+        const result = await this._writeNextChapterLocked(bookId, wordCount);
+        if (result.status === "state-degraded") throw new Error("REWRITE_STATE_VALIDATION_FAILED: original chapters restored");
+        return result;
+      });
+    } finally { await release(); }
+  }
+
   async resyncChapterArtifacts(bookId: string, chapterNumber?: number): Promise<ChapterPipelineResult> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.resyncChapterArtifacts(bookId, chapterNumber));
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
       return await this._resyncChapterArtifactsLocked(bookId, chapterNumber);
@@ -1904,6 +2037,7 @@ export class PipelineRunner {
     readonly chapter: ChapterPipelineResult;
     readonly audit: AuditResult & { readonly chapterNumber: number };
   }> {
+    if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.resyncChapterStateAndAudit(bookId, chapterNumber, options));
     const releaseLock = await this.state.acquireBookLock(bookId);
     try {
       const chapter = await this._resyncChapterArtifactsLocked(bookId, chapterNumber, options);
@@ -2323,7 +2457,8 @@ export class PipelineRunner {
     }
 
     const resolvedStatus = chapterStatus ?? (auditResult.passed ? "ready-for-review" : "audit-failed");
-    await persistChapterArtifacts({
+    this.currentAbortSignal()?.throwIfAborted();
+    await this.publishChapterMutation(bookId, () => persistChapterArtifacts({
       chapterNumber,
       chapterTitle: persistenceOutput.title,
       status: resolvedStatus,
@@ -2352,7 +2487,7 @@ export class PipelineRunner {
       syncCurrentStateFactHistory: () => this.syncCurrentStateFactHistory(bookId, chapterNumber),
       logSnapshotStage: () =>
         this.logStage(stageLanguage, { zh: "更新章节索引与快照", en: "updating chapter index and snapshots" }),
-    });
+    }));
 
     // 6. Send notification
     if (this.config.notifyChannels && this.config.notifyChannels.length > 0) {
@@ -2360,7 +2495,7 @@ export class PipelineRunner {
         ? "🧯"
         : auditResult.passed ? "✅" : "⚠️";
       const chapterLength = formatLengthCount(finalWordCount, lengthSpec.countingMode);
-      await dispatchNotification(this.config.notifyChannels, {
+      await afterBookCommit(bookDir, () => dispatchNotification(this.config.notifyChannels!, {
         title: `${statusEmoji} ${book.title} 第${chapterNumber}章`,
         body: [
           `**${persistenceOutput.title}** | ${chapterLength}`,
@@ -2374,7 +2509,7 @@ export class PipelineRunner {
         ]
           .filter(Boolean)
           .join("\n"),
-      });
+      }));
     }
 
     await this.emitWebhook("pipeline-complete", bookId, chapterNumber, {
@@ -2487,11 +2622,13 @@ export class PipelineRunner {
       throw new Error(`State repair still failed for chapter ${targetChapter}.`);
     }
 
+    this.currentAbortSignal()?.throwIfAborted();
+    return this.publishChapterMutation(bookId, async () => {
     await this.state.invalidateChapterStateFrom(bookId, targetChapter);
     if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
       throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state repair.`);
     }
-    await writer.saveChapter(bookDir, repairedOutput, gp.numericalSystem, pipelineLang);
+    await writer.saveChapter(bookDir, repairedOutput, gp.numericalSystem, pipelineLang, { preserveBody: true });
     await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, repairedOutput);
     await this.state.snapshotState(bookId, targetChapter);
 
@@ -2501,6 +2638,7 @@ export class PipelineRunner {
     index[targetIndex] = {
       ...targetMeta,
       status: baseStatus,
+      stateIntegrity: { status: "valid" },
       updatedAt: new Date().toISOString(),
       auditIssues: targetMeta.auditIssues.filter((issue) => !injectedIssues.has(issue)),
       reviewNote: undefined,
@@ -2519,7 +2657,7 @@ export class PipelineRunner {
       auditResult: {
         passed: repairedPassesAudit,
         issues: [],
-        summary: repairedPassesAudit ? "state repaired" : "state repaired but chapter still needs review",
+      summary: repairedPassesAudit ? "state repaired" : "state repaired but chapter still needs review",
       },
       revised: false,
       status: baseStatus,
@@ -2527,6 +2665,7 @@ export class PipelineRunner {
       lengthTelemetry: targetMeta.lengthTelemetry,
       tokenUsage: targetMeta.tokenUsage,
     };
+    });
   }
 
   private async _resyncChapterArtifactsLocked(
@@ -2646,11 +2785,13 @@ export class PipelineRunner {
       throw new Error(`Chapter sync still failed for chapter ${targetChapter}.`);
     }
 
+    this.currentAbortSignal()?.throwIfAborted();
+    return this.publishChapterMutation(bookId, async () => {
     await this.state.invalidateChapterStateFrom(bookId, targetChapter);
     if (targetChapter !== latestChapter && !await this.state.restoreState(bookId, baselineChapter)) {
       throw new Error(`Cannot restore baseline snapshot ${baselineChapter} for state sync.`);
     }
-    await writer.saveChapter(bookDir, syncedOutput, gp.numericalSystem, pipelineLang);
+    await writer.saveChapter(bookDir, syncedOutput, gp.numericalSystem, pipelineLang, { preserveBody: true });
     await this.syncLegacyStructuredStateFromMarkdown(bookDir, targetChapter, syncedOutput);
     await this.state.snapshotState(bookId, targetChapter);
 
@@ -2664,6 +2805,7 @@ export class PipelineRunner {
       index[targetIndex] = {
         ...targetMeta,
         status: finalStatus,
+        stateIntegrity: { status: "valid" },
         updatedAt: new Date().toISOString(),
         auditIssues: targetMeta.auditIssues.filter((issue) => !injectedIssues.has(issue)),
         reviewNote: undefined,
@@ -2672,6 +2814,7 @@ export class PipelineRunner {
       index[targetIndex] = {
         ...targetMeta,
         status: "ready-for-review",
+        stateIntegrity: { status: "valid" },
         updatedAt: new Date().toISOString(),
       };
     }
@@ -2697,6 +2840,7 @@ export class PipelineRunner {
       lengthTelemetry: targetMeta.lengthTelemetry,
       tokenUsage: targetMeta.tokenUsage,
     };
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -3102,7 +3246,7 @@ ${matrix}`,
         );
         await this.resetImportReplayTruthFiles(bookDir, resolvedLanguage);
         await this.state.saveChapterIndex(input.bookId, [], { allowEmptyWithChapterFiles: true });
-        await this.state.snapshotState(input.bookId, 0);
+        await this.publishChapterMutation(input.bookId, () => this.state.snapshotState(input.bookId, 0));
 
         // Generate style guide from imported chapters
         if (foundationSource.length >= 500) {
@@ -3164,6 +3308,7 @@ ${matrix}`,
         };
 
         // Save chapter file + core truth files (state, ledger, hooks)
+        await this.publishChapterMutation(input.bookId, async () => {
         await writer.saveChapter(bookDir, persistedOutput, gp.numericalSystem, resolvedLanguage);
 
         await this.syncLegacyStructuredStateFromMarkdown(bookDir, chapterNumber, output);
@@ -3191,6 +3336,7 @@ ${matrix}`,
 
         // Snapshot state after each chapter for rollback + resume support
         await this.state.snapshotState(input.bookId, chapterNumber);
+        });
 
         importedCount++;
         totalWords += chapterWordCount;
@@ -3275,13 +3421,26 @@ ${matrix}`,
     const existingIndex = await this.state.loadChapterIndex(bookId);
     const pendingChapter = [...existingIndex].sort((left, right) => left.number - right.number)
       .find((chapter) => chapter.number < beforeChapter && isChapterStateDegraded(chapter));
-    if (!pendingChapter) {
-      return;
+    if (pendingChapter) {
+      throw new Error(
+        `Chapter ${pendingChapter.number} is state-degraded. Run write repair-state or write sync for chapter ${pendingChapter.number} before continuing.`,
+      );
     }
-
-    throw new Error(
-      `Chapter ${pendingChapter.number} is state-degraded. Run write repair-state or write sync for chapter ${pendingChapter.number} before continuing.`,
-    );
+    const { inspectBookHealth } = await import("../state/book-health.js");
+    const { planBookRecovery } = await import("./book-recovery.js");
+    const health = await inspectBookHealth(this.state.bookDir(bookId));
+    const requiredBaseline = Number.isFinite(beforeChapter)
+      ? beforeChapter - 1
+      : Math.max(0, ...existingIndex.map(chapter => chapter.number), ...health.pendingChapters, health.stateFrontier ?? 0);
+    if (health.pendingOperationId || health.issues.some(issue => issue.code === "TRANSACTION_RECOVERY_REQUIRED")) {
+      throw new Error("TRANSACTION_RECOVERY_REQUIRED");
+    }
+    if (health.stateFrontier === null || health.stateFrontier < requiredBaseline) {
+      const recoveryPlan = requiredBaseline > 0 ? planBookRecovery(health, requiredBaseline) : undefined;
+      throw Object.assign(new Error(
+        `STATE_RECOVERY_REQUIRED: chapter ${requiredBaseline + 1} requires verified baseline ${requiredBaseline}; current state frontier is ${health.stateFrontier ?? "missing"}. Inspect recovery status and repair the retained prefix before continuing.`,
+      ), { code: "STATE_RECOVERY_REQUIRED", health, recoveryPlan });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -3887,24 +4046,18 @@ ${matrix}`,
     data?: Record<string, unknown>,
   ): Promise<void> {
     if (!this.config.notifyChannels || this.config.notifyChannels.length === 0) return;
-    await dispatchWebhookEvent(this.config.notifyChannels, {
+    await afterBookCommit(this.state.bookDir(bookId), () => dispatchWebhookEvent(this.config.notifyChannels!, {
       event,
       bookId,
       chapterNumber,
       timestamp: new Date().toISOString(),
       data,
-    });
+    }));
   }
 
   private async readChapterContent(bookDir: string, chapterNumber: number): Promise<string> {
-    const chaptersDir = join(bookDir, "chapters");
-    const files = await readdir(chaptersDir);
-    const paddedNum = String(chapterNumber).padStart(4, "0");
-    const chapterFile = files.find((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
-    if (!chapterFile) {
-      throw new Error(`Chapter ${chapterNumber} file not found in ${chaptersDir}`);
-    }
-    const raw = await readFile(join(chaptersDir, chapterFile), "utf-8");
+    const { readRecoveryBody } = await import("../state/recovery-index.js");
+    const raw = (await readRecoveryBody(bookDir, chapterNumber)).bytes.toString("utf8");
     // Strip the title line
     const lines = raw.split("\n");
     const contentStart = lines.findIndex((l, i) => i > 0 && l.trim().length > 0);

@@ -1,0 +1,45 @@
+import { afterEach, beforeEach, expect, it } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createBookSnapshot } from "../state/book-snapshot.js";
+import { withBookTransaction } from "../state/book-transaction.js";
+import { findRecoveryBaseline, restoreRecoveryBaseline } from "../state/recovery-backup.js";
+import { StateManager } from "../state/manager.js";
+let project: string;
+let book: string;
+beforeEach(async () => {
+  const temp = fileURLToPath(new URL("../../../../temp/", import.meta.url));
+  await mkdir(temp, { recursive: true });
+  project = await mkdtemp(join(temp, "baseline-recovery-"));
+  book = join(project, "books/fixture");
+  await mkdir(join(book, "story"), { recursive: true });
+  await mkdir(join(book, "chapters"));
+  for (const name of ["current_state.md", "pending_hooks.md"]) await writeFile(join(book, "story", name), "initial", "utf8");
+  await writeFile(join(book, "chapters/index.json"), JSON.stringify([{ number: 1, status: "approved" }]), "utf8");
+  await writeFile(join(book, "chapters/0001_fixture.md"), "retained body", "utf8");
+  await createBookSnapshot(book, 0);
+});
+afterEach(async () => { await rm(project, { recursive: true, force: true }); });
+it("restores only the selected verified baseline and invalidates descendants while retaining prose and canon", async () => {
+  await withBookTransaction(book, async () => { await rm(join(book, "story/snapshots/0"), { recursive: true }); });
+  const available = await findRecoveryBaseline(book);
+  expect(available).toMatchObject({ chapter: 0 });
+  await writeFile(join(book, "story/current_state.md"), "live user edit", "utf8");
+  await writeFile(join(book, "story/story_bible.md"), "current canon", "utf8");
+  await new StateManager(project).restoreRecoveryBaseline("fixture", available!.backupId);
+  expect(await readFile(join(book, "story/snapshots/0/current_state.md"), "utf8")).toBe("initial");
+  expect(await readFile(join(book, "story/current_state.md"), "utf8")).toBe("live user edit");
+  expect(await readFile(join(book, "story/story_bible.md"), "utf8")).toBe("current canon");
+  expect(await readFile(join(book, "chapters/0001_fixture.md"), "utf8")).toBe("retained body");
+  expect(JSON.parse(await readFile(join(book, "chapters/index.json"), "utf8"))[0].status).toBe("state-degraded");
+});
+it("does not offer a corrupted or unverified backup as a baseline", async () => {
+  await withBookTransaction(book, async () => undefined);
+  const available = await findRecoveryBaseline(book);
+  const source = join(book, "story/recovery", available!.backupId, "before/story/snapshots/0/current_state.md");
+  await writeFile(source, "tampered", "utf8");
+  expect(await findRecoveryBaseline(book)).toBeNull();
+  await expect(restoreRecoveryBaseline(book, available!.backupId)).rejects.toThrow();
+  await expect(restoreRecoveryBaseline(book, "../../outside")).rejects.toThrow(/backup/i);
+});

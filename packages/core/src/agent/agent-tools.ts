@@ -1,11 +1,13 @@
 import { Type, type Static } from "@mariozechner/pi-ai";
+import { assertAuthorDocumentPath, canonChangeAffectsState } from "./operation-policy.js";
+import { readBookConsistently } from "../state/book-transaction.js";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
 import type { PipelineRunner } from "../pipeline/runner.js";
 import { ArchitectIncompleteFoundationError } from "../agents/architect.js";
 import { type ReviseMode } from "../agents/reviser.js";
 import { defaultChapterLength } from "../utils/length-metrics.js";
 import { inferLanguage } from "../utils/language.js";
-import { mkdir, readFile, writeFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, stat, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StateManager } from "../state/manager.js";
 import { deleteLatestChapter } from "../state/chapter-delete.js";
@@ -64,12 +66,64 @@ function textResult<T = undefined>(text: string, details?: T): AgentToolResult<T
   return { content: [{ type: "text", text }], details: details as T };
 }
 
+function candidateErrorResult(error: unknown, bookId: string | null): AgentToolResult<unknown> | undefined {
+  const failure = error as { candidateId?: string; chapterNumber?: number; reasonCode?: string; stage?: string; name?: string };
+  if (!failure?.candidateId) return undefined;
+  return textResult(String(error), {
+    kind: "chapter_revision", bookId, applied: false,
+    status: failure.name === "AbortError" ? "cancelled" : "failed",
+    candidateId: failure.candidateId, chapterNumber: failure.chapterNumber, reasonCode: failure.reasonCode, stage: failure.stage,
+    transportError: true,
+  });
+}
+
 /**
  * Resolve a user-supplied relative path against the books root and guard
  * against path-traversal (../ etc.).
  */
 function safeBooksPath(booksRoot: string, relativePath: string): string {
   return safeChildPath(booksRoot, relativePath);
+}
+
+async function readToolPathConsistently<T>(projectRoot: string, filePath: string, read: () => Promise<T>): Promise<T> {
+  const booksRoot = join(projectRoot, "books");
+  const bookDirs = new Set<string>();
+  const collect = (root: string, target: string) => {
+    const local = relative(root, target);
+    if (!local || isAbsolute(local) || local === ".." || local.startsWith("../") || local.startsWith("..\\")) return;
+    bookDirs.add(join(root, local.split(/[\\/]/u)[0]));
+  };
+  collect(booksRoot, filePath);
+  try { collect(await realpath(booksRoot), await realpath(filePath)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  let callback = read;
+  for (const bookDir of bookDirs) {
+    const inner = callback;
+    callback = () => readBookConsistently(bookDir, inner);
+  }
+  return callback();
+}
+
+async function mutateAuthorDocument<T>(projectRoot: string, filePath: string, task: () => Promise<T>): Promise<T> {
+  const booksRoot = join(projectRoot, "books");
+  await assertAuthorDocumentPath(booksRoot, filePath);
+  const bookId = relative(booksRoot, filePath).split(/[\\/]/u)[0];
+  const state = new StateManager(projectRoot);
+  const release = await state.acquireBookLock(bookId);
+  try {
+    return await state.publishBookMutation(bookId, async () => {
+      await assertAuthorDocumentPath(booksRoot, filePath);
+      const before = await readFile(filePath, "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      const result = await task();
+      if (canonChangeAffectsState(relative(state.bookDir(bookId), filePath)) && before !== await readFile(filePath, "utf8")) {
+        await state.invalidateChapterStateFrom(bookId, 1);
+      }
+      return result;
+    });
+  } finally { await release(); }
 }
 
 function resolveToolBookId(
@@ -1112,6 +1166,7 @@ export function createSubAgentTool(
                 title: titleResult,
                 wordCount,
                 status: resultStatus,
+                outcome: (result as any).outcome,
                 skillIds,
                 ...(result.contextTrace ? { contextTrace: result.contextTrace } : {}),
               },
@@ -1171,6 +1226,8 @@ export function createSubAgentTool(
               auditPassed: result.auditPassed,
               auditIssues: result.auditIssues,
               revisionDiagnostics: result.revisionDiagnostics,
+              outcome: (result as any).outcome,
+              candidateId: result.candidateId,
               skillIds,
             };
             if (!applied) {
@@ -1225,6 +1282,8 @@ export function createSubAgentTool(
               return textResult(`Unknown agent: ${agent}`);
           }
         } catch (err: any) {
+          const candidateFailure = candidateErrorResult(err, bookId ?? activeBookId);
+          if (candidateFailure) return candidateFailure;
           if (agent === "architect" && err instanceof ArchitectIncompleteFoundationError) {
             const missing = err.missing.join(", ");
             return textResult(
@@ -3338,7 +3397,7 @@ export function createWriteTruthFileTool(
         await tools.writeTruthFile(bookId, fileName, params.content);
         return textResult(`Updated "${fileName}" for "${bookId}".`);
       } catch (err: any) {
-        return textResult(`write_truth_file failed: ${err?.message ?? String(err)}`);
+        throw new Error(`write_truth_file failed: ${err?.message ?? String(err)}`);
       }
     },
   };
@@ -3481,6 +3540,84 @@ export function createReplaceChapterTextTool(
   };
 }
 
+const RecoveryStatusParams = Type.Object({
+  bookId: Type.Optional(Type.String({ description: "Defaults to the active book." })),
+  targetChapter: Type.Optional(Type.Integer({ minimum: 1, description: "Optional explicit recovery target for a read-only plan." })),
+});
+
+const RecoverTransactionParams = Type.Object({ bookId: Type.Optional(Type.String()) });
+export function createRecoverTransactionTool(projectRoot: string, activeBookId: string | null): AgentTool<typeof RecoverTransactionParams> {
+  return {
+    name: "recover_transaction", label: "Recover Transaction",
+    description: "After an explicit recovery request, restore interrupted publication without a model call. Does not settle chapters or steal live locks. Inspect recovery_status first.",
+    parameters: RecoverTransactionParams,
+    async execute(_id, params, signal) {
+      signal?.throwIfAborted();
+      const bookId = resolveToolBookId("recover_transaction", params.bookId, activeBookId);
+      const result = await new StateManager(projectRoot).recoverPendingTransaction(bookId);
+      return textResult(JSON.stringify(result), { kind: "transaction_recovery", bookId, ...result });
+    },
+  };
+}
+
+export function createRecoveryStatusTool(pipeline: PipelineRunner, activeBookId: string | null): AgentTool<typeof RecoveryStatusParams> {
+  return {
+    name: "recovery_status", label: "Recovery Status",
+    description: "Inspect book state health and an optional recovery plan without changing files or calling a model. Available while recovery is pending.",
+    parameters: RecoveryStatusParams,
+    async execute(_id, params) {
+      const bookId = resolveToolBookId("recovery_status", params.bookId, activeBookId);
+      const result = await pipeline.getRecoveryStatus(bookId, params.targetChapter);
+      return textResult(JSON.stringify(result), { kind: "recovery_status", bookId, ...result });
+    },
+  };
+}
+
+const RecoverChaptersParams = Type.Object({
+  bookId: Type.Optional(Type.String({ description: "Defaults to the active book." })),
+  targetChapter: Type.Integer({ minimum: 1, description: "Explicit user-authorized last chapter to repair. Do not expand the range." }),
+});
+
+export function createRecoverChaptersTool(pipeline: PipelineRunner, activeBookId: string | null): AgentTool<typeof RecoverChaptersParams> {
+  return {
+    name: "recover_chapters", label: "Recover Chapter State",
+    description: "Execute ordered state recovery through the explicit target, preserving every chapter body. Use after the user requests state repair; inspect recovery_status first. Never deletes or rewrites prose.",
+    parameters: RecoverChaptersParams,
+    async execute(_id, params, signal) {
+      const bookId = resolveToolBookId("recover_chapters", params.bookId, activeBookId);
+      const result = await runPipelineWithAgentContext(pipeline, signal, [], () => pipeline.recoverChapters(bookId, params.targetChapter));
+      return textResult(JSON.stringify(result), { kind: "chapter_recovery", bookId, chapterNumber: params.targetChapter, preservesBodies: true, ...result });
+    },
+  };
+}
+
+const ResumeCandidateParams = Type.Object({
+  bookId: Type.Optional(Type.String({ description: "Defaults to the active book." })),
+  candidateId: Type.String({ minLength: 1, description: "Exact preserved candidate ID returned by a rejected revision. Never invent an ID." }),
+  legacyRevisionGate: Type.Optional(Type.Union([Type.Literal("strict"), Type.Literal("lenient"), Type.Literal("always")], { description: "Legacy candidates only: the user's explicitly selected publication policy. Never infer or silently choose a policy." })),
+});
+
+export function createResumeRevisionCandidateTool(pipeline: PipelineRunner, activeBookId: string | null): AgentTool<typeof ResumeCandidateParams> {
+  return {
+    name: "resume_revision_candidate", label: "Resume Revision Candidate",
+    description: "After an explicit user retry, revalidate and settle a preserved revision candidate without invoking the reviser again. Rejects stale inputs and keeps published prose unchanged on failure.",
+    parameters: ResumeCandidateParams,
+    async execute(_id, params, signal) {
+      const bookId = resolveToolBookId("resume_revision_candidate", params.bookId, activeBookId);
+      try {
+        const result = await runPipelineWithAgentContext(pipeline, signal, [], () => params.legacyRevisionGate
+          ? pipeline.resumeRevisionCandidate(bookId, params.candidateId, { legacyRevisionGate: params.legacyRevisionGate })
+          : pipeline.resumeRevisionCandidate(bookId, params.candidateId));
+        return textResult(JSON.stringify(result), { kind: "chapter_revision", bookId, candidateId: params.candidateId, ...result });
+      } catch (error) {
+        const candidateFailure = candidateErrorResult(error, bookId);
+        if (candidateFailure) return candidateFailure;
+        throw error;
+      }
+    },
+  };
+}
+
 const ResyncChapterStateParams = Type.Object({
   bookId: Type.Optional(Type.String({ description: "Book ID. Omit to use the active book." })),
   chapterNumber: Type.Optional(Type.Number({ description: "Persisted chapter number to rebuild, including a middle chapter. Chapter N requires snapshot N-1. Omit to use the latest chapter; repair earlier degraded chapters first." })),
@@ -3528,6 +3665,7 @@ export function createResyncChapterStateTool(
           ].join("\n");
       return textResult(summary, {
         kind: "chapter_state_resynced",
+        outcome: (result as any).outcome,
         bookId,
         chapterNumber: result.chapter.chapterNumber,
         status: result.audit.passed ? "ready-for-review" : "audit-failed",
@@ -3582,7 +3720,7 @@ export function createReadTool(
     ): Promise<AgentToolResult<undefined>> {
       try {
         const filePath = resolveReadPath(readRoot, params.path, options);
-        const content = await readFile(filePath, "utf-8");
+        const content = await readToolPathConsistently(projectRoot, filePath, () => readFile(filePath, "utf-8"));
         return textResult(content);
       } catch (err: any) {
         throw new Error(`Failed to read "${params.path}": ${err?.message ?? String(err)}`);
@@ -3619,19 +3757,21 @@ export function createEditTool(projectRoot: string): AgentTool<typeof EditParams
     ): Promise<AgentToolResult<undefined>> {
       try {
         const filePath = safeBooksPath(booksRoot, params.path);
-        const content = await readFile(filePath, "utf-8");
-        const idx = content.indexOf(params.old_string);
-        if (idx === -1) {
-          return textResult(`old_string not found in "${params.path}".`);
-        }
-        if (content.indexOf(params.old_string, idx + 1) !== -1) {
-          return textResult(`old_string appears more than once in "${params.path}". Provide a more specific match.`);
-        }
-        const updated = content.slice(0, idx) + params.new_string + content.slice(idx + params.old_string.length);
-        await writeFile(filePath, updated, "utf-8");
-        return textResult(`File "${params.path}" updated successfully.`);
+        return await mutateAuthorDocument(projectRoot, filePath, async () => {
+          const content = await readFile(filePath, "utf-8");
+          const idx = content.indexOf(params.old_string);
+          if (idx === -1) {
+            throw new Error(`old_string not found in "${params.path}".`);
+          }
+          if (content.indexOf(params.old_string, idx + 1) !== -1) {
+            throw new Error(`old_string appears more than once in "${params.path}". Provide a more specific match.`);
+          }
+          const updated = content.slice(0, idx) + params.new_string + content.slice(idx + params.old_string.length);
+          await writeFile(filePath, updated, "utf-8");
+          return textResult(`File "${params.path}" updated successfully.`);
+        });
       } catch (err: any) {
-        return textResult(`Failed to edit "${params.path}": ${err?.message ?? String(err)}`);
+        throw new Error(`Failed to edit "${params.path}": ${err?.message ?? String(err)}`);
       }
     },
   };
@@ -3664,13 +3804,14 @@ export function createWriteFileTool(projectRoot: string): AgentTool<typeof Write
     ): Promise<AgentToolResult<undefined>> {
       try {
         const filePath = safeBooksPath(booksRoot, params.path);
-        const parentDir = resolve(filePath, "..");
-        const { mkdir } = await import("node:fs/promises");
-        await mkdir(parentDir, { recursive: true });
-        await writeFile(filePath, params.content, "utf-8");
-        return textResult(`File "${params.path}" written successfully.`);
+        return await mutateAuthorDocument(projectRoot, filePath, async () => {
+          const parentDir = resolve(filePath, "..");
+          await mkdir(parentDir, { recursive: true });
+          await writeFile(filePath, params.content, "utf-8");
+          return textResult(`File "${params.path}" written successfully.`);
+        });
       } catch (err: any) {
-        return textResult(`Failed to write "${params.path}": ${err?.message ?? String(err)}`);
+        throw new Error(`Failed to write "${params.path}": ${err?.message ?? String(err)}`);
       }
     },
   };
@@ -3700,50 +3841,52 @@ export function createGrepTool(projectRoot: string): AgentTool<typeof GrepParams
     ): Promise<AgentToolResult<undefined>> {
       try {
         const bookDir = safeBooksPath(booksRoot, params.bookId);
-        const regex = new RegExp(params.pattern, "gi");
-        const results: string[] = [];
+        return await readBookConsistently(bookDir, async () => {
+          const regex = new RegExp(params.pattern, "gi");
+          const results: string[] = [];
 
-        async function searchDir(dir: string, prefix: string) {
-          let entries: string[];
-          try {
-            entries = await readdir(dir);
-          } catch {
-            return; // directory doesn't exist
-          }
-          for (const entry of entries) {
-            const fullPath = join(dir, entry);
-            const entryStat = await stat(fullPath);
-            if (entryStat.isDirectory()) {
-              await searchDir(fullPath, `${prefix}${entry}/`);
-            } else if (entry.endsWith(".md") || entry.endsWith(".txt") || entry.endsWith(".json")) {
-              const content = await readFile(fullPath, "utf-8");
-              const lines = content.split("\n");
-              for (let i = 0; i < lines.length; i++) {
-                if (regex.test(lines[i])) {
-                  results.push(`${prefix}${entry}:${i + 1}: ${lines[i]}`);
-                  regex.lastIndex = 0; // reset for next test
+          async function searchDir(dir: string, prefix: string) {
+            let entries: string[];
+            try {
+              entries = await readdir(dir);
+            } catch {
+              return; // directory doesn't exist
+            }
+            for (const entry of entries) {
+              const fullPath = join(dir, entry);
+              const entryStat = await stat(fullPath);
+              if (entryStat.isDirectory()) {
+                await searchDir(fullPath, `${prefix}${entry}/`);
+              } else if (entry.endsWith(".md") || entry.endsWith(".txt") || entry.endsWith(".json")) {
+                const content = await readFile(fullPath, "utf-8");
+                const lines = content.split("\n");
+                for (let i = 0; i < lines.length; i++) {
+                  if (regex.test(lines[i])) {
+                    results.push(`${prefix}${entry}:${i + 1}: ${lines[i]}`);
+                    regex.lastIndex = 0; // reset for next test
+                  }
                 }
               }
             }
           }
-        }
 
-        await Promise.all([
-          searchDir(join(bookDir, "story"), "story/"),
-          searchDir(join(bookDir, "chapters"), "chapters/"),
-        ]);
+          await Promise.all([
+            searchDir(join(bookDir, "story"), "story/"),
+            searchDir(join(bookDir, "chapters"), "chapters/"),
+          ]);
 
-        if (results.length === 0) {
-          return textResult(`No matches for "${params.pattern}" in book "${params.bookId}".`);
-        }
+          if (results.length === 0) {
+            return textResult(`No matches for "${params.pattern}" in book "${params.bookId}".`);
+          }
 
-        const truncated = results.length > 100
-          ? results.slice(0, 100).join("\n") + `\n\n... [${results.length - 100} more matches]`
-          : results.join("\n");
+          const truncated = results.length > 100
+            ? results.slice(0, 100).join("\n") + `\n\n... [${results.length - 100} more matches]`
+            : results.join("\n");
 
-        return textResult(truncated);
+          return textResult(truncated);
+        });
       } catch (err: any) {
-        return textResult(`Grep failed: ${err?.message ?? String(err)}`);
+        throw new Error(`Grep failed: ${err?.message ?? String(err)}`);
       }
     },
   };
@@ -3775,27 +3918,29 @@ export function createLsTool(projectRoot: string): AgentTool<typeof LsParams> {
       try {
         const base = safeBooksPath(booksRoot, params.bookId);
         const target = params.subdir ? safeBooksPath(base, params.subdir) : base;
+        return await readToolPathConsistently(projectRoot, target, async () => {
 
-        const entries = await readdir(target);
-        const details: string[] = [];
+          const entries = await readdir(target);
+          const details: string[] = [];
 
-        for (const entry of entries) {
-          const fullPath = join(target, entry);
-          const readPath = relative(booksRoot, fullPath).replace(/\\/g, "/");
-          try {
-            const entryStat = await stat(fullPath);
-            const suffix = entryStat.isDirectory() ? "/" : ` (${entryStat.size} bytes)`;
-            details.push(`${readPath}${suffix}`);
-          } catch {
-            details.push(readPath);
+          for (const entry of entries) {
+            const fullPath = join(target, entry);
+            const readPath = relative(booksRoot, fullPath).replace(/\\/g, "/");
+            try {
+              const entryStat = await stat(fullPath);
+              const suffix = entryStat.isDirectory() ? "/" : ` (${entryStat.size} bytes)`;
+              details.push(`${readPath}${suffix}`);
+            } catch {
+              details.push(readPath);
+            }
           }
-        }
 
-        if (details.length === 0) {
-          return textResult(`Directory is empty: ${params.bookId}/${params.subdir ?? ""}`);
-        }
+          if (details.length === 0) {
+            return textResult(`Directory is empty: ${params.bookId}/${params.subdir ?? ""}`);
+          }
 
-        return textResult(`Paths relative to books/ (file paths can be passed to read):\n${details.join("\n")}`);
+          return textResult(`Paths relative to books/ (file paths can be passed to read):\n${details.join("\n")}`);
+        });
       } catch (err: any) {
         throw new Error(`Failed to list "${params.bookId}/${params.subdir ?? ""}": ${err?.message ?? String(err)}`);
       }

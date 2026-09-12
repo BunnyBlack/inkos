@@ -6,6 +6,8 @@ import type { SSEMessage } from "../hooks/use-sse";
 import { useColors } from "../hooks/use-colors";
 import { deriveBookActivity, shouldRefetchBookView } from "../hooks/use-book-activity";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { BookRecoveryPanel } from "../components/BookRecoveryPanel";
+import { requestBookRecovery } from "../lib/book-recovery-api";
 import {
   ChevronLeft,
   Zap,
@@ -111,11 +113,13 @@ export function BookDetail({
   const [exportFormat, setExportFormat] = useState<ExportFormat>("txt");
   const [exportApprovedOnly, setExportApprovedOnly] = useState(false);
   const [bookActionPending, setBookActionPending] = useState<string | null>(null);
+  const [recoveryCandidate, setRecoveryCandidate] = useState<string | undefined>();
   // Auto (pipeline self-reviews) vs manual (write the draft and stop; you
   // run audit / revise / approve as checkpoint actions). This is scoped to
   // the current book, with project-level mode as the inherited default.
   const [reviewMode, setReviewMode] = useState<"auto" | "manual">("auto");
   useEffect(() => {
+    setRecoveryCandidate(undefined);
     void fetchJson<{ mode?: string }>(`/books/${encodeURIComponent(bookId)}/chapter-review-mode`)
       .then((r) => setReviewMode(r.mode === "manual" ? "manual" : "auto"))
       .catch(() => undefined);
@@ -233,11 +237,9 @@ export function BookDetail({
     if (brief === null) return;
     setRevisingChapters((prev) => [...prev, chapterNum]);
     try {
-      await fetchJson(`/books/${bookId}/revise/${chapterNum}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, brief: brief.trim() || undefined }),
-      });
+      const result = await requestBookRecovery(`/books/${encodeURIComponent(bookId)}/revise/${chapterNum}`, { mode, brief: brief.trim() || undefined });
+      if (result.candidateId) setRecoveryCandidate(result.candidateId);
+      if (result.applied === false) alert(data?.book.language === "en" ? "Revision was not applied. Use State recovery to retry the preserved candidate." : "修订未发布。可在状态恢复面板重试保留候选。");
       refetch();
     } catch (e) {
       alert(e instanceof Error ? e.message : "Revision failed");
@@ -423,7 +425,10 @@ export function BookDetail({
     </div>
   );
 
-  if (error) return <div className="text-destructive p-8 bg-destructive/5 rounded-xl border border-destructive/20">Error: {error}</div>;
+  if (error) return <div className="space-y-4">
+    <div role="alert" className="text-destructive p-8 bg-destructive/5 rounded-xl border border-destructive/20">Error: {error}</div>
+    <BookRecoveryPanel key={bookId} bookId={bookId} chapters={[]} onChanged={refetch} initialInspect />
+  </div>;
   if (!data) return null;
 
   const { book, chapters } = data;
@@ -641,6 +646,8 @@ export function BookDetail({
             </button>
           </div>
       </div>
+
+      <BookRecoveryPanel key={bookId} bookId={bookId} chapters={data.chapters.map(chapter => chapter.number)} language={data.book.language} candidate={recoveryCandidate} busy={writing || drafting || revisingChapters.length > 0 || rewritingChapters.length > 0} onChanged={refetch} />
 
       {/* Book Settings */}
       <div className="paper-sheet rounded-2xl border border-border/40 shadow-sm p-6">

@@ -43,6 +43,7 @@ export async function persistChapterArtifacts(params: {
     number: params.chapterNumber,
     title: params.chapterTitle,
     status: params.status,
+    stateIntegrity: { status: params.status === "state-degraded" ? "degraded" : "valid" },
     wordCount: params.finalWordCount,
     createdAt: now,
     updatedAt: now,

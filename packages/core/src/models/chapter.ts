@@ -28,6 +28,10 @@ export const ChapterMetaSchema = z.object({
   auditIssues: z.array(z.string()).default([]),
   lengthWarnings: z.array(z.string()).default([]),
   reviewNote: z.string().optional(),
+  stateIntegrity: z.object({
+    status: z.enum(["valid", "degraded", "stale"]),
+    sourceRevision: z.string().optional(),
+  }).optional(),
   detectionScore: z.number().min(0).max(1).optional(),
   detectionProvider: z.string().optional(),
   detectedAt: z.string().datetime().optional(),

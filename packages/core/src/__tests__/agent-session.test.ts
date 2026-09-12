@@ -1485,6 +1485,10 @@ describe("runAgentSession cache — bookId switch", () => {
 
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
       "sub_agent",
+      "recovery_status",
+      "recover_transaction",
+      "recover_chapters",
+      "resume_revision_candidate",
       "generate_cover",
       "read",
       "write_truth_file",
@@ -1507,6 +1511,15 @@ describe("runAgentSession cache — bookId switch", () => {
     ]);
   });
 
+  it("limits interrupted-book sessions to recovery tools and rebuilds after recovery", async () => {
+    const config = { sessionId: "recovery-limited", bookId: "book-a", language: "zh", pipeline: {} as any, projectRoot, model: { provider: "x", id: "y", api: "anthropic-messages" } as any };
+    await runAgentSession({ ...config, recoveryOnly: true }, "recover");
+    expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual(["recovery_status", "recover_transaction"]);
+    await runAgentSession(config, "continue");
+    expect(agentInstances).toHaveLength(2);
+    expect(agentInstances[1].state.tools.map((tool: any) => tool.name)).toContain("sub_agent");
+  });
+
   it("suppresses book-mutating production tools while a background task runs and restores them on flag change", async () => {
     const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
     const pipeline = {} as any;
@@ -1519,6 +1532,7 @@ describe("runAgentSession cache — bookId switch", () => {
       "任务在跑吗？",
     );
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
+      "recovery_status",
       "read",
       "research_web",
       "ingest_material",
@@ -1540,6 +1554,10 @@ describe("runAgentSession cache — bookId switch", () => {
     expect(agentInstances).toHaveLength(2);
     expect(agentInstances[1].state.tools.map((tool: any) => tool.name)).toEqual([
       "sub_agent",
+      "recovery_status",
+      "recover_transaction",
+      "recover_chapters",
+      "resume_revision_candidate",
       "generate_cover",
       "read",
       "write_truth_file",
@@ -1572,6 +1590,10 @@ describe("runAgentSession cache — bookId switch", () => {
     );
 
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
+      "recovery_status",
+      "recover_transaction",
+      "recover_chapters",
+      "resume_revision_candidate",
       "read",
       "write_truth_file",
       "rename_entity",

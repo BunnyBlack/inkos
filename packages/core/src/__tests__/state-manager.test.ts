@@ -7,6 +7,12 @@ import type { BookConfig } from "../models/book.js";
 import type { ChapterMeta } from "../models/chapter.js";
 
 describe("StateManager", () => {
+  it("rejects book identifiers that escape the project book root", () => {
+    const state = new StateManager("E:/project");
+    for (const id of ["../outside", "..", "book/subdir", "book\\subdir", "E:outside", "book.", ""]) {
+      expect(() => state.bookDir(id)).toThrow("Invalid book ID");
+    }
+  });
   let tempDir: string;
   let manager: StateManager;
 
@@ -773,7 +779,7 @@ describe("StateManager", () => {
       }
     });
 
-    it("reclaims an expired lease whose recorded pid was reused by another live process", async () => {
+    it("does not steal an expired lease from a possibly live writer", async () => {
       const bookId = "lock-book-expired-lease";
       await mkdir(manager.bookDir(bookId), { recursive: true });
       const lockPath = join(manager.bookDir(bookId), ".write.lock");
@@ -788,15 +794,8 @@ describe("StateManager", () => {
 
       const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
       try {
-        const release = await manager.acquireBookLock(bookId);
-        const lockData = JSON.parse(await readFile(lockPath, "utf-8")) as {
-          pid: number;
-          token: string;
-        };
-
-        expect(lockData.pid).toBe(process.pid);
-        expect(lockData.token).not.toBe("abandoned-owner");
-        await release();
+        await expect(manager.acquireBookLock(bookId)).rejects.toMatchObject({ code: "BOOK_BUSY" });
+        expect(JSON.parse(await readFile(lockPath, "utf8")).token).toBe("abandoned-owner");
       } finally {
         killSpy.mockRestore();
       }
@@ -1325,6 +1324,10 @@ describe("StateManager", () => {
 
     it("restores state to the target chapter and removes subsequent chapters", async () => {
       await setupRollbackBook();
+      const { rename } = await import("node:fs/promises");
+      const renamedDir = join(manager.bookDir(bookId), "chapters");
+      await rename(join(renamedDir, "0002_Title_Two.md"), join(renamedDir, "2-retained.md"));
+      await writeFile(join(renamedDir, "20-retained.md"), "Unindexed chapter twenty", "utf8");
 
       const discarded = await manager.rollbackToChapter(bookId, 1);
 

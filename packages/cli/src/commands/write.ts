@@ -1,7 +1,5 @@
 import { Command } from "commander";
-import { PipelineRunner, StateManager, resolveChapterReviewMode } from "@actalk/inkos-core";
-import { readdir, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { PipelineRunner, StateManager, resolveChapterReviewMode, inspectBookHealth, planBookRecovery, listRecoveryCandidates, findRecoveryBaseline, discardRecoveryCandidate } from "@actalk/inkos-core";
 import { createInterface } from "node:readline";
 import { loadConfig, buildPipelineConfig, findProjectRoot, getLegacyMigrationHint, resolveContext, resolveBookId, log, logError } from "../utils.js";
 import {
@@ -18,6 +16,127 @@ import { sendCommandNotification } from "../notify-helper.js";
 
 export const writeCommand = new Command("write")
   .description("Write chapters");
+
+function recoveryTarget(raw: string): number {
+  if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("INVALID_RECOVERY_TARGET: chapter must be a positive integer / 章节必须为正整数");
+  return Number(raw);
+}
+
+async function recoveryArguments(args: ReadonlyArray<string>, root: string): Promise<{ bookId: string; value: string }> {
+  if (args.length < 1 || args.length > 2) throw new Error("Expected [book-id] <chapter-or-candidate> / 请指定章节或候选编号");
+  return { bookId: await resolveBookId(args.length === 2 ? args[0] : undefined, root), value: args.at(-1)! };
+}
+
+function recoveryError(error: unknown, json: boolean): void {
+  const failure = error as { candidateId?: string; reasonCode?: string; code?: string; stage?: string; name?: string };
+  if (json) log(JSON.stringify({ status: failure.name === "AbortError" ? "cancelled" : "failed", error: String(error), candidateId: failure.candidateId, reasonCode: failure.reasonCode ?? failure.code, stage: failure.stage }));
+  else logError(`Recovery failed / 恢复失败: ${String(error)}${failure.candidateId ? ` Candidate: ${failure.candidateId}; use write resume-candidate.` : ""}`);
+  process.exitCode = 1;
+}
+
+writeCommand.command("recover-transaction")
+  .description("Recover interrupted publication without model configuration / 恢复中断事务")
+  .argument("[book-id]")
+  .option("--json", "Output JSON")
+  .action(async (bookIdArg: string | undefined, opts) => {
+    try {
+      const root = findProjectRoot();
+      const bookId = await resolveBookId(bookIdArg, root);
+      log(JSON.stringify(await new StateManager(root).recoverPendingTransaction(bookId), null, 2));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("recovery-status")
+  .description("Inspect state integrity without model calls / 只读检查状态完整性")
+  .argument("[book-id]")
+  .option("--chapter <n>", "Preview recovery through chapter")
+  .option("--json", "Output JSON")
+  .action(async (bookIdArg: string | undefined, opts) => {
+    try {
+      const root = findProjectRoot();
+      const bookId = await resolveBookId(bookIdArg, root);
+      const health = await inspectBookHealth(new StateManager(root).bookDir(bookId));
+      const candidates = await listRecoveryCandidates(new StateManager(root).bookDir(bookId));
+      const availableBaselineBackup = health.verifiedBaselines.includes(0) ? null : await findRecoveryBaseline(new StateManager(root).bookDir(bookId));
+      const result = { health, candidates, availableBaselineBackup, ...(opts.chapter ? { plan: planBookRecovery(health, recoveryTarget(opts.chapter)) } : {}) };
+      log(JSON.stringify(result, null, 2));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("restore-baseline")
+  .description("Restore snapshot zero from a selected verified backup / 从指定已验证备份恢复初始快照")
+  .argument("<args...>", "[book-id] <backup-id>")
+  .option("--json", "Output JSON")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      const root = findProjectRoot();
+      const { bookId, value: backupId } = await recoveryArguments(args, root);
+      const state = new StateManager(root);
+      await state.restoreRecoveryBaseline(bookId, backupId);
+      log(JSON.stringify({ status: "applied", backupId, health: await inspectBookHealth(state.bookDir(bookId)) }, null, 2));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("recover")
+  .description("Recover retained chapter state in order / 按顺序恢复已有正文的状态")
+  .argument("<args...>", "[book-id] <chapter>")
+  .option("--dry-run", "Inspect the recovery plan without changing files")
+  .option("--json", "Output JSON")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      const root = findProjectRoot();
+      const { bookId, value } = await recoveryArguments(args, root);
+      const chapter = recoveryTarget(value);
+      if (opts.dryRun) {
+        const health = await inspectBookHealth(new StateManager(root).bookDir(bookId));
+        const plan = planBookRecovery(health, chapter);
+        log(JSON.stringify({ health, plan }, null, 2));
+        if (plan.blockedReason) process.exitCode = 1;
+        return;
+      }
+      const config = await loadConfig();
+      const pipeline = new PipelineRunner(buildPipelineConfig(config, root));
+      const result = await pipeline.recoverChapters(bookId, chapter);
+      log(JSON.stringify(result, null, 2));
+      if (!["applied", "unchanged"].includes(result.status)) process.exitCode = 1;
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("discard-candidate")
+  .description("Discard an unpublished revision candidate, retaining its evidence and published prose")
+  .argument("<args...>", "[book-id] <candidate-id>")
+  .option("--json", "Output JSON")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      const root = findProjectRoot();
+      const { bookId, value: candidateId } = await recoveryArguments(args, root);
+      const state = new StateManager(root);
+      const release = await state.acquireBookLock(bookId);
+      try { await discardRecoveryCandidate(state.bookDir(bookId), candidateId); }
+      finally { await release(); }
+      log(JSON.stringify({ status: "discarded", candidateId, preservesBodies: true }));
+    } catch (error) { recoveryError(error, opts.json); }
+  });
+
+writeCommand.command("resume-candidate")
+  .description("Retry settlement of a preserved revision / 重试保留候选的状态结算")
+  .argument("<args...>", "[book-id] <candidate-id>")
+  .option("--json", "Output JSON")
+  .option("--legacy-revision-gate <gate>", "Explicit policy for a legacy candidate: strict, lenient, always")
+  .action(async (args: ReadonlyArray<string>, opts) => {
+    try {
+      const root = findProjectRoot();
+      const { bookId, value: candidateId } = await recoveryArguments(args, root);
+      if (opts.legacyRevisionGate && !["strict", "lenient", "always"].includes(opts.legacyRevisionGate)) throw new Error("INVALID_CANDIDATE_POLICY");
+      const config = await loadConfig();
+      const pipeline = new PipelineRunner(buildPipelineConfig(config, root));
+      const result = opts.legacyRevisionGate
+        ? await pipeline.resumeRevisionCandidate(bookId, candidateId, { legacyRevisionGate: opts.legacyRevisionGate })
+        : await pipeline.resumeRevisionCandidate(bookId, candidateId);
+      log(JSON.stringify(result, null, 2));
+      if (!result.applied) process.exitCode = 1;
+    } catch (error) { recoveryError(error, opts.json); }
+  });
 
 writeCommand
   .command("next")
@@ -172,52 +291,9 @@ writeCommand
       const book = await state.loadBookConfig(bookId);
       notifyLanguage = resolveCliLanguage(book.language);
       notifyBookName = book.title ?? bookId;
-      const bookDir = state.bookDir(bookId);
-      const chaptersDir = join(bookDir, "chapters");
-      const restoreFrom = chapter - 1;
-      const restoreSnapshotDir = join(bookDir, "story", "snapshots", String(restoreFrom));
-      await stat(restoreSnapshotDir).catch(() => {
-        throw new Error(`Cannot rewrite chapter ${chapter}: missing snapshot for chapter ${restoreFrom}`);
-      });
       const migrationHint = await getLegacyMigrationHint(root, bookId);
       if (migrationHint && !opts.json) {
         log(`[migration] ${migrationHint}`);
-      }
-
-      // Remove existing chapter file
-      const files = await readdir(chaptersDir);
-      const paddedNum = String(chapter).padStart(4, "0");
-      const existing = files.filter((f) => f.startsWith(paddedNum) && f.endsWith(".md"));
-      for (const f of existing) {
-        await unlink(join(chaptersDir, f));
-        if (!opts.json) log(`Removed: ${f}`);
-      }
-
-      // Remove from index (and all chapters after it)
-      const index = await state.loadChapterIndex(bookId);
-      const trimmed = index.filter((ch) => ch.number < chapter);
-      await state.saveChapterIndex(bookId, trimmed);
-
-      // Also remove later chapter files since state will be rolled back
-      const laterFiles = files.filter((f) => {
-        const num = parseInt(f.slice(0, 4), 10);
-        return num > chapter && f.endsWith(".md");
-      });
-      for (const f of laterFiles) {
-        await unlink(join(chaptersDir, f));
-        if (!opts.json) log(`Removed later chapter: ${f}`);
-      }
-
-      // Restore state to previous chapter's end-state (chapter 1 uses snapshot-0 from initBook)
-      const restored = await state.restoreState(bookId, restoreFrom);
-      if (!restored) {
-        throw new Error(`Cannot rewrite chapter ${chapter}: failed to restore snapshot for chapter ${restoreFrom}`);
-      }
-      if (!opts.json) log(`State restored from chapter ${restoreFrom} snapshot.`);
-
-      const nextChapter = await state.getNextChapterNumber(bookId);
-      if (nextChapter !== chapter) {
-        throw new Error(`Cannot rewrite chapter ${chapter}: expected next chapter to be ${chapter}, but resolved to ${nextChapter}`);
       }
 
       if (!opts.json) log(`Regenerating chapter ${chapter}...`);
@@ -230,7 +306,7 @@ writeCommand
         chapterReviewMode: resolveChapterReviewMode(book, config.writing),
       }));
 
-      const result = await pipeline.writeNextChapter(bookId, wordCount);
+      const result = await pipeline.rewriteFromChapter(bookId, chapter, wordCount);
       const language = resolveCliLanguage(book.language);
 
       if (opts.json) {

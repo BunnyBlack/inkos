@@ -3,6 +3,8 @@ import { join } from "node:path";
 import type { ChapterMeta } from "../models/chapter.js";
 import { isChapterStateDegraded } from "../pipeline/chapter-state-recovery.js";
 import { toPosixPath } from "../utils/posix-path.js";
+import { withBookTransaction, isBookTransactionActive } from "./book-transaction.js";
+import { readBookSnapshot, SnapshotValidationError } from "./book-snapshot.js";
 
 export interface ChapterDeleteDeps {
   bookDir(bookId: string): string;
@@ -41,6 +43,9 @@ export async function deleteLatestChapter(
   bookId: string,
   options: DeleteLatestChapterOptions = {},
 ): Promise<DeleteLatestChapterResult> {
+  if (!isBookTransactionActive(deps.bookDir(bookId))) {
+    return withBookTransaction(deps.bookDir(bookId), () => deleteLatestChapter(deps, bookId, options));
+  }
   const index = await deps.loadChapterIndex(bookId);
   if (index.length === 0) {
     throw new Error(`Book "${bookId}" has no chapters to delete.`);
@@ -70,7 +75,12 @@ export async function deleteLatestChapter(
         throw error;
       }
     }));
-    if (usable.every(Boolean)) break;
+    if (usable.every(Boolean)) {
+      try { if (await readBookSnapshot(bookDir, rollbackTarget)) break; }
+      catch (error) {
+        if (!(error instanceof SnapshotValidationError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
   }
   if (rollbackTarget < 0) {
     throw new Error(

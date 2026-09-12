@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
+import { operationResultFailed, productionOperation } from "./operation-policy.js";
 
 const MAX_MODEL_CALLS = 32;
 const MAX_IDENTICAL_FAILURES = 3;
@@ -25,23 +26,82 @@ export class SessionLoopGuard {
   private pending = new Map<string, string>();
   private failures = new Map<string, { name: string; count: number }>();
   private reads = new Map<string, { name: string; result: string; count: number }>();
+  private productionCalls = new Map<string, Record<string, unknown>>();
+  private productionFailures = new Map<string, { count: number; candidateId?: string }>();
+  private productionQueue: Promise<unknown> = Promise.resolve();
 
   reset(): void {
     this.modelCalls = 0;
     this.pending.clear();
     this.failures.clear();
     this.reads.clear();
+    this.productionCalls.clear();
+    this.productionFailures.clear();
+  }
+
+  /** Checked per execute, so a third call in the same response cannot bypass the budget. */
+  beforeToolExecution(name: string, args: Record<string, unknown>): void {
+    if (productionOperation(name, args)) this.assertProductionBudget();
+  }
+
+  async executeTool<T>(name: string, id: string, args: Record<string, unknown>, execute: () => Promise<T>): Promise<T> {
+    if (!productionOperation(name, args)) return execute();
+    const task = this.productionQueue.then(async () => {
+      this.beforeToolExecution(name, args);
+      try {
+        const result = await execute();
+        this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result, isError: false } as AgentEvent);
+        return result;
+      } catch (error) {
+        if ((error as Error)?.name === "AbortError") {
+          this.pending.delete(id);
+          this.productionCalls.delete(id);
+          throw error;
+        }
+        this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result: undefined, isError: true } as unknown as AgentEvent);
+        throw error;
+      }
+    });
+    this.productionQueue = task.catch(() => undefined);
+    return task;
+  }
+
+  private assertProductionBudget(): void {
+    for (const failure of this.productionFailures.values()) {
+      if (failure.count >= 2) throw new Error(`Agent loop guard: chapter production failed ${failure.count} times on unchanged inputs. Stopped this turn; inspect the recovery status and retry the preserved candidate${failure.candidateId ? ` ${failure.candidateId}` : ""} in an explicit user turn. Generic state writes are forbidden.`);
+    }
   }
 
   observe(event: AgentEvent): void {
     if (event.type === "tool_execution_start") {
       this.pending.set(event.toolCallId, fingerprint([event.toolName, event.args]));
+      if (productionOperation(event.toolName, event.args as Record<string, unknown>)) {
+        this.productionCalls.set(event.toolCallId, event.args as Record<string, unknown>);
+      }
       return;
     }
     if (event.type !== "tool_execution_end") return;
     const signature = this.pending.get(event.toolCallId);
     this.pending.delete(event.toolCallId);
     if (!signature) return;
+    const productionArgs = this.productionCalls.get(event.toolCallId);
+    this.productionCalls.delete(event.toolCallId);
+    if (productionArgs && (event.isError || operationResultFailed(event.result))) {
+      const details = (event.result as any)?.details;
+      const outcome = details?.outcome;
+      const key = fingerprint([
+        details?.bookId ?? productionArgs.bookId ?? "active",
+        details?.chapterNumber ?? productionArgs.chapterNumber ?? "latest",
+        details?.sourceRevision ?? outcome?.sourceRevision ?? "unchanged",
+        "chapter-production", outcome?.stage ?? details?.stage ?? "production",
+      ]);
+      this.productionFailures.set(key, {
+        count: (this.productionFailures.get(key)?.count ?? 0) + 1,
+        candidateId: outcome?.candidateId ?? details?.candidateId,
+      });
+      this.reads.delete(signature);
+      return;
+    }
 
     // These events include argument-validation errors that never reach execute().
     if (event.isError) {
@@ -65,6 +125,7 @@ export class SessionLoopGuard {
   }
 
   beforeModelCall(): void {
+    this.assertProductionBudget();
     for (const failure of this.failures.values()) {
       if (failure.count >= MAX_IDENTICAL_FAILURES) {
         throw new Error(`Agent loop guard: ${failure.name} failed ${failure.count} times with the same arguments. Stopped this turn; inspect the tool errors before retrying.`);
