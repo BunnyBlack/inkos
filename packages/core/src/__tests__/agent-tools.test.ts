@@ -277,6 +277,9 @@ describe("agent deterministic writing tools", () => {
       })),
     });
     const tool = createResyncChapterStateTool(pipeline as never, "harbor", { language: "en" });
+    expect(tool.parameters.properties.chapterNumber.description).toContain("including a middle chapter");
+    expect(tool.description).toContain("N-1");
+    expect(tool.description).toContain("snapshot 0");
 
     const result = await tool.execute("resync-3", { chapterNumber: 3, allowNewHooks: false });
 

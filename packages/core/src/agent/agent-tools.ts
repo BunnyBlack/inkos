@@ -3483,7 +3483,7 @@ export function createReplaceChapterTextTool(
 
 const ResyncChapterStateParams = Type.Object({
   bookId: Type.Optional(Type.String({ description: "Book ID. Omit to use the active book." })),
-  chapterNumber: Type.Optional(Type.Number({ description: "Latest chapter number to rebuild from its persisted body. Omit to use the latest chapter." })),
+  chapterNumber: Type.Optional(Type.Number({ description: "Persisted chapter number to rebuild, including a middle chapter. Chapter N requires snapshot N-1. Omit to use the latest chapter; repair earlier degraded chapters first." })),
   allowNewHooks: Type.Optional(Type.Boolean({
     description:
       "Whether settlement may create brand-new hook IDs. Set false when the user asks to preserve stable hook IDs, avoid replacement hooks, or only repair existing truth state.",
@@ -3499,6 +3499,7 @@ export function createResyncChapterStateTool(
     name: "resync_chapter_state",
     description:
       "Keep the persisted chapter body unchanged, rebuild its derived story state, summaries, and hooks from the previous chapter snapshot, then run a fresh audit. " +
+      "Chapter N uses snapshot N-1: chapter 1 needs snapshot 0 and produces snapshot 1 on successful rebuilding; a missing snapshot 1 does not itself block rebuilding chapter 1. " +
       "Use after an explicit chapter edit or when the user asks to repair/synchronize truth state without rewriting prose. Repair earlier degraded chapters first. Syncing a middle chapter preserves later bodies but invalidates their state; rebuild them in chapter order.",
     label: "Resync Chapter State",
     parameters: ResyncChapterStateParams,

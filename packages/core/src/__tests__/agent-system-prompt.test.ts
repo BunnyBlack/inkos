@@ -3,6 +3,14 @@ import { buildAgentSystemPrompt } from "../agent/agent-system-prompt.js";
 import { createSkillRegistry } from "../skills/index.js";
 
 describe("buildAgentSystemPrompt", () => {
+  it.each(["zh", "en"] as const)("describes current ordered state recovery in %s", language => {
+    const prompt = buildAgentSystemPrompt("test-book", language);
+    expect(prompt).toContain(language === "zh" ? "中间章" : "middle chapter");
+    expect(prompt).toContain("N-1");
+    expect(prompt).toContain(language === "zh" ? "历史报错" : "historical errors");
+    expect(prompt).toContain(language === "zh" ? "快照 0" : "snapshot 0");
+    expect(prompt).not.toContain("保留最新章节正文");
+  });
   describe("mode isolation", () => {
     it("defaults no-book sessions to plain chat, not book creation", () => {
       const prompt = buildAgentSystemPrompt(null, "zh");

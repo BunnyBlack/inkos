@@ -573,7 +573,9 @@ function buildBookPrompt(bookId: string, isZh: boolean): string {
 - 连续写多章只启动一次 writer 并传入章数，不要重复或并发启动。
 - 章节生产必须落盘：不要在聊天正文里输出章节来冒充完成。sub_agent 成功后结束本轮，完成态只以成功工具结果为准。
 - 用户给出明确旧文本和新文本时可做局部 patch；用户给出完整替换稿时可整章 replace；需要模型生成整章修改时必须走 reviser。
-- 用户明确要求保留最新章节正文、只重建状态/摘要/伏笔或重新审稿时，用 resync_chapter_state；不要再调用 reviser 改写正文。
+- 用户明确要求保留章节正文、只重建状态/摘要/伏笔或重新审稿时，用 resync_chapter_state；不要再调用 reviser 改写正文。支持中间章；先修复更早的降级章节，重建后按章号顺序修复后续失效状态，后续正文保留。
+- 第 N 章状态重建使用快照 N-1；第 1 章使用快照 0，快照 1 是成功重建后的结果，不是前置条件。不要手工复制旧状态冒充缺失快照。
+- 历史报错只说明当时的结果，不代表当前工具仍有相同限制。依据当前工具说明、文件和本轮实际执行结果判断；用户已明确授权状态修复且目标清楚时调用对应工具，不要仅凭旧报错宣称死锁或反复索要同一确认。
 - 如果用户还要求保留现有伏笔编号、不得生成替代编号或新伏笔，调用 resync_chapter_state 时设 allowNewHooks=false。
 - 修改设定或角色卡时先读取权威文件，再只改用户要求的部分；不要用章节编辑工具改正典。
 - 研究报告、资料卡和检索片段只是参考，不会自动成为正典。只有用户明确授权后才可写入设定；绑定资料时保留用户原话中的用途。
@@ -596,6 +598,8 @@ ${commonOutputRules(true)}`
 - Chapter production must be persisted. Do not emit chapter prose in chat as if it were saved. End the turn after sub_agent succeeds, and derive completion only from a successful tool result.
 - Use a local patch only when the user supplies an exact old/new edit, and whole replacement only when the user supplies the complete replacement. Model-generated whole-chapter changes must use reviser.
 - When the user wants chapter prose preserved and only asks to rebuild state, summaries, hooks, or re-audit it, use resync_chapter_state instead of reviser. Repair earlier degraded chapters first. Syncing a middle chapter preserves later prose but invalidates later state; rebuild those chapters in order before continuing.
+- Rebuilding chapter N uses snapshot N-1; chapter 1 uses snapshot 0. Snapshot 1 is the result of successful rebuilding, not a prerequisite for chapter 1. Never copy old state to fabricate a missing snapshot.
+- Treat historical errors as results from that time, not current capability limits. Use current tool descriptions, files, and results from this turn. When state repair is explicitly authorized and the target is clear, call the appropriate tool instead of declaring a deadlock from old errors or repeatedly requesting the same confirmation.
 - If the user also requires stable hook IDs to be preserved and forbids replacement or new hooks, call resync_chapter_state with allowNewHooks=false.
 - Read the authoritative file before changing canon or a role card, preserve everything outside the requested change, and never edit canon through chapter tools.
 - Research reports, material cards, and retrieved passages are references, not canon. Write them into canon only after explicit user authorization, and preserve the user's stated purpose when binding a reference.
