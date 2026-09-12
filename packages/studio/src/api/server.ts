@@ -6793,7 +6793,6 @@ export async function startStudioServer(
   if (options?.staticDir) {
     const { readFile: readFileFs } = await import("node:fs/promises");
     const { join: joinPath } = await import("node:path");
-    const { existsSync } = await import("node:fs");
 
     // Serve static assets (js, css, etc.)
     app.get("/assets/*", async (c) => {
@@ -6819,13 +6818,18 @@ export async function startStudioServer(
 
     // SPA fallback — serve index.html for all non-API routes
     const indexPath = joinPath(options.staticDir!, "index.html");
-    if (existsSync(indexPath)) {
-      const indexHtml = await readFileFs(indexPath, "utf-8");
-      app.get("*", (c) => {
-        if (c.req.path.startsWith("/api/v1/")) return c.notFound();
-        return c.html(indexHtml);
-      });
-    }
+    app.get("*", async (c) => {
+      if (c.req.path.startsWith("/api/v1/")) return c.notFound();
+      // Rebuilds replace hashed assets, so the entry document must come from
+      // the same current build instead of being retained for the process lifetime.
+      c.header("Cache-Control", "no-store");
+      try {
+        return c.html(await readFileFs(indexPath, "utf-8"));
+      } catch {
+        c.header("Retry-After", "1");
+        return c.text("Studio frontend is unavailable. A build may be in progress; please reload shortly.", 503);
+      }
+    });
   }
 
   console.log(`InkOS Studio running on http://localhost:${port}`);
