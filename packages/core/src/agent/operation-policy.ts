@@ -1,5 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isSafeBookId } from "../utils/book-id.js";
 
 const DERIVED_FILES = new Set([
   "current_state.md", "pending_hooks.md", "chapter_summaries.md",
@@ -56,6 +57,47 @@ export function productionOperation(name: string, args: Record<string, unknown>)
   if (name === "sub_agent" && ["writer", "reviser"].includes(String(args.agent))) return "chapter-production";
   if (["resync_chapter_state", "recover_chapters", "recover_transaction", "resume_revision_candidate", "resume_settlement_attempt"].includes(name)) return "chapter-production";
   return undefined;
+}
+
+const BOOK_MUTATION_TOOLS = new Set([
+  "write_truth_file",
+  "rename_entity",
+  "patch_chapter_text",
+  "replace_chapter_text",
+  "delete_latest_chapter",
+  "import_chapters",
+  "continuation_import",
+]);
+
+function bookIdFromConstrainedPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const path = value.replaceAll("\\", "/");
+  if (isAbsolute(path) || path.startsWith("/") || path.split("/").some((part) => part === "..")) return undefined;
+  const [bookId] = path.split("/").filter((part) => part !== "" && part !== ".");
+  return isSafeBookId(bookId) ? bookId : undefined;
+}
+
+/**
+ * Return the book resource guarded by a mutating tool.
+ *
+ * The active book is authoritative for tools whose schema has a bookId field;
+ * generic write/edit tools have no such field, so their constrained books/
+ * path supplies the resource instead.
+ */
+export function mutationBookId(
+  name: string,
+  args: Record<string, unknown>,
+  activeBookId: string | null,
+): string | undefined {
+  if (name === "write" || name === "edit") {
+    return bookIdFromConstrainedPath(args.path);
+  }
+
+  if (!BOOK_MUTATION_TOOLS.has(name) && !productionOperation(name, args)
+    && !(name === "sub_agent" && args.agent === "auditor")) return undefined;
+
+  if (isSafeBookId(activeBookId)) return activeBookId;
+  return isSafeBookId(args.bookId) ? args.bookId : undefined;
 }
 
 export function canonChangeAffectsState(bookRelativePath: string): boolean {

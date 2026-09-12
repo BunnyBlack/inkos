@@ -249,4 +249,42 @@ describe("StateValidatorAgent", () => {
       "en",
     )).rejects.toThrow("empty response");
   });
+
+  it("returns layout evidence rewritten to the complete original source span", async () => {
+    const agent = new StateValidatorAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: { temperature: 0.7, maxTokens: 4096, thinkingBudget: 0, extra: {} },
+      },
+      model: "test-model",
+      projectRoot: process.cwd(),
+    });
+
+    vi.spyOn(agent as unknown as { chat: (...args: unknown[]) => Promise<unknown> }, "chat")
+      .mockResolvedValue({
+        content: JSON.stringify({ verdict: "REPAIR", issues: [{
+          category: "missing_state_update", description: "The state missed the departure.", blocking: true,
+          kind: "omission", basis: "explicit", target: "candidate-state",
+          rationale: "The chapter explicitly records both actions.",
+          evidence: [{ source: "chapter", quote: "甲走上楼梯。乙留在门口。" }],
+        }] }),
+        usage: ZERO_USAGE,
+      });
+
+    const result = await agent.validate(
+      "甲走上楼梯。\r\n\r\n乙留在门口。",
+      3,
+      "旧状态",
+      "新状态",
+      "旧钩子",
+      "新钩子",
+      "zh",
+    );
+    expect(result.issues?.[0]?.evidence[0]).toMatchObject({
+      source: "chapter",
+      quote: "甲走上楼梯。\r\n\r\n乙留在门口。",
+    });
+  });
 });

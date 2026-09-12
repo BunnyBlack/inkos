@@ -13,7 +13,8 @@ import type {
 import { fetchJson } from "../../../../hooks/use-api";
 import { tr } from "../../../../lib/app-language";
 import { isConfirmedProductionSend } from "../../message-policy";
-import { attachSessionStreamListeners } from "./stream-events";
+import { attachSessionStreamListeners, buildBusinessFailureSummary } from "./stream-events";
+import type { AgentOperationOutcome } from "@actalk/inkos-core/agent/operation-outcomes";
 import {
   bookKey,
   createSessionRuntime,
@@ -581,6 +582,19 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
       const finalContent = data.details?.draftRaw || data.response || "";
       const toolCall = data.details?.toolCall ?? undefined;
       const responseToolExecutions = data.details?.toolExecutions ?? [];
+      const rawOperationOutcomes = (data as AgentResponse & { operationOutcomes?: unknown }).operationOutcomes
+        ?? (data.details as (AgentResponse["details"] & { operationOutcomes?: unknown }) | undefined)?.operationOutcomes;
+      const operationOutcomes: AgentOperationOutcome[] = Array.isArray(rawOperationOutcomes)
+        ? rawOperationOutcomes.filter((outcome): outcome is AgentOperationOutcome => (
+            Boolean(outcome) && typeof outcome === "object"
+            && typeof (outcome as { bookId?: unknown }).bookId === "string"
+            && typeof (outcome as { toolCallId?: unknown }).toolCallId === "string"
+            && ["applied", "unchanged", "failed", "blocked", "cancelled"].includes((outcome as { status?: unknown }).status as string)
+          ))
+        : [];
+      const businessFailureSummary = buildBusinessFailureSummary(operationOutcomes);
+      const showBusinessFailureSummary = !isProductionTaskSend
+        && get().sessions[sessionId]?.isChatStreaming !== false;
       const responseBookId = data.session?.activeBookId ?? data.session?.bookId;
       const responseSessionKind = data.session?.sessionKind;
       if (responseBookId || responseSessionKind || data.session?.title || data.session?.playMode) {
@@ -662,6 +676,11 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
           // updates the restored card, or appends one when no SSE event was observed.
           attachResponseTools();
         }
+      } else if (businessFailureSummary) {
+        // A business failure has a useful persisted outcome even when the
+        // transport returned no prose or tool details; do not replace it with
+        // the generic protocol-empty response.
+        if (hasStream) get().finalizeStream(sessionId, streamTs, "", toolCall);
       } else {
         if (hasStream) {
           get().finalizeStream(sessionId, streamTs, "", toolCall);
@@ -674,6 +693,21 @@ export const createMessageSlice: StateCreator<ChatStore, [], [], MessageActions>
           // 空响应同样算这轮失败；用户主动停止的轮 isChatStreaming 已是 false，不记录。
           if (get().sessions[sessionId]?.isChatStreaming) rememberFailedSend();
         }
+      }
+      if (showBusinessFailureSummary && businessFailureSummary) {
+        set((state) => ({
+          sessions: updateSession(state.sessions, sessionId, (runtime) => {
+            const alreadyShown = runtime.messages.some((message) => message.timestamp >= streamTs
+              && message.role === "assistant" && message.content === businessFailureSummary);
+            return alreadyShown ? {} : {
+              messages: [...runtime.messages, {
+                role: "assistant" as const,
+                content: businessFailureSummary,
+                timestamp: Date.now(),
+              }],
+            };
+          }),
+        }));
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);

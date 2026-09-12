@@ -36,6 +36,11 @@
     "./forecast/schema": {
       "types": "./dist/forecast/schema.d.ts",
       "import": "./dist/forecast/schema.js"
+    },
+    "./agent/operation-outcomes": {
+      "types": "./dist/agent/operation-outcomes.d.ts",
+      "import": "./dist/agent/operation-outcomes.js",
+      "default": "./dist/agent/operation-outcomes.js"
     }
   },
   "files": [

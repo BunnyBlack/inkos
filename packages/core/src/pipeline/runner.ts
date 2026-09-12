@@ -5,7 +5,7 @@ import { inspectBookHealth } from "../state/book-health.js";
 import { planBookRecovery, type RecoveryPlan } from "./book-recovery.js";
 import { captureCandidateInputs } from "./recovery-candidate.js";
 import { loadSettlementAttempt, listSettlementAttempts, readSettlementEvents, markSettlementApplied, appendSettlementEvent } from "./settlement-attempt.js";
-import { captureSettlementRecording, validateRecordedSettlement, settlementFailure, buildStateValidationFeedback, settlementMadeNoProgress } from "./chapter-state-recovery.js";
+import { captureSettlementRecording, validateRecordedSettlement, settlementFailure, isReusablePassValidation, hasCompleteRepairFeedbackShape, settlementErrorMessage, settlementMadeNoProgress } from "./chapter-state-recovery.js";
 import type { LLMClient, OnStreamProgress } from "../llm/provider.js";
 import { createLLMClient } from "../llm/provider.js";
 import { runWorkerAgent } from "../agent/worker-agent.js";
@@ -1986,7 +1986,8 @@ export class PipelineRunner {
   async recoverChapters(bookId: string, targetChapter: number): Promise<{
     status: "applied" | "unchanged" | "failed" | "blocked" | "cancelled";
     completed: number[]; plan: RecoveryPlan; reasonCode?: string; error?: string; failedChapter?: number; addedChapters?: number[];
-    attemptId?: string; stage?: string; issues?: unknown; nextActions?: string[];
+    attemptId?: string; stage?: string; issues?: unknown; failureKind?: "protocol" | "evidence" | "content";
+    diagnosticPath?: string; nextActions?: string[];
   }> {
     if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.recoverChapters(bookId, targetChapter));
     const release = await this.state.acquireBookLock(bookId);
@@ -2022,7 +2023,8 @@ export class PipelineRunner {
 
   async resumeSettlementAttempt(bookId: string, attemptId: string, action: "revalidate" | "repair"): Promise<{
     status: "applied" | "unchanged" | "failed" | "cancelled"; attemptId?: string; chapterNumber?: number;
-    reasonCode?: string; stage?: string; error?: string; issues?: unknown; nextActions?: string[]; failedChapter?: number;
+    reasonCode?: string; stage?: string; error?: string; issues?: unknown; failureKind?: "protocol" | "evidence" | "content";
+    diagnosticPath?: string; nextActions?: string[]; failedChapter?: number;
   }> {
     if (!this.operationContext.getStore()) return this.runWithAgentContext({}, () => this.resumeSettlementAttempt(bookId, attemptId, action));
     const release = await this.state.acquireBookLock(bookId);
@@ -2052,7 +2054,7 @@ export class PipelineRunner {
       return { ...result, status: "applied" as const, attemptId };
     } catch (error) {
       return { status: this.currentAbortSignal()?.aborted ? "cancelled" as const : "failed" as const,
-        ...settlementFailure(error), failedChapter, attemptId: (error as { attemptId?: string }).attemptId ?? attemptId, error: String(error) };
+        ...settlementFailure(error), failedChapter, attemptId: (error as { attemptId?: string }).attemptId ?? attemptId, error: settlementErrorMessage(error) };
     } finally { await release(); }
   }
 
@@ -2673,36 +2675,45 @@ export class PipelineRunner {
       });
     }
     const priorEvents = priorAttempt ? await readSettlementEvents(bookDir, priorAttempt.attemptId) : [];
-    const lastValidation = priorEvents.filter(event => event.type === "rejected" || event.type === "validated").at(-1)?.data as ValidationResult | undefined;
-    let syncedOutput = priorAttempt && options.resumeAction === "revalidate" ? priorAttempt.output : await writer.settleChapterState({
+    const lastValidationEvent = priorEvents.filter(event => event.type === "rejected" || event.type === "validated").at(-1);
+    const lastValidation = isReusablePassValidation(lastValidationEvent?.data) ? lastValidationEvent.data : undefined;
+    const previousRepairValidation = hasCompleteRepairFeedbackShape(lastValidationEvent?.data) ? lastValidationEvent.data : undefined;
+    // A resumed attempt is already a complete candidate. Always validate that
+    // exact candidate before considering repair; old rejection diagnostics are
+    // never feedback for a new writer call.
+    let syncedOutput = priorAttempt ? priorAttempt.output : await writer.settleChapterState({
       book,
       bookDir,
       chapterNumber: targetChapter,
       ...context,
       title: targetMeta.title,
       content,
-      previousSettlement: priorAttempt?.output,
-      validationFeedback: priorAttempt ? buildStateValidationFeedback(lastValidation?.warnings ?? [], pipelineLang) : undefined,
+      previousSettlement: undefined,
+      validationFeedback: undefined,
       allowReapply: true,
     });
     const validator = new StateValidatorAgent(this.agentCtxFor("state-validator", bookId));
     const recorded = priorAttempt?.status === "validated" && options.resumeAction === "revalidate"
-      && lastValidation?.passed === true && !lastValidation.repairRequired && Array.isArray(lastValidation.warnings)
+      && lastValidation?.passed === true && !lastValidation.repairRequired
       ? { attempt: priorAttempt, validation: lastValidation }
       : await validateRecordedSettlement({ validator, bookDir, chapterNumber: targetChapter,
         content, output: syncedOutput, oldState, oldHooks, language: pipelineLang, recording, parentAttemptId: priorAttempt?.attemptId });
     let attemptId = recorded.attempt.attemptId;
     let validation = recorded.validation;
 
-    if ((!validation.passed || validation.repairRequired) && priorAttempt) {
-      const reasonCode = lastValidation && settlementMadeNoProgress(priorAttempt.output, syncedOutput, lastValidation, validation)
-        ? "SETTLEMENT_NO_PROGRESS" : "SETTLEMENT_REJECTED";
-      await appendSettlementEvent(bookDir, attemptId, { type: "rejected", data: { ...validation, reasonCode } });
-      throw Object.assign(new Error(validation.warnings.map(issue => issue.description).join("; ") || "Settlement rejected"), {
-        reasonCode, stage: "validation", attemptId, issues: validation.issues ?? validation.warnings,
-      });
-    }
     if (!validation.passed || validation.repairRequired) {
+      // Explicit revalidation reports the verified result and stops. Explicit
+      // repair may proceed only from a verified REPAIR result, and gets one
+      // writer call followed by one recorded validation attempt.
+      if (priorAttempt && options.resumeAction !== "repair") {
+        const reasonCode = validation.repairRequired === false
+          ? "SETTLEMENT_REJECTED"
+          : (previousRepairValidation && settlementMadeNoProgress(priorAttempt.output, syncedOutput, previousRepairValidation, validation)
+            ? "SETTLEMENT_NO_PROGRESS" : "SETTLEMENT_REPAIR_REQUIRED");
+        throw Object.assign(new Error(validation.warnings.map(issue => issue.description).join("; ") || "Settlement rejected"), {
+          reasonCode, stage: "validation", attemptId, issues: validation.issues ?? validation.warnings,
+        });
+      }
       const recovery = await retrySettlementAfterValidationFailure({
         writer,
         validator,
@@ -2710,21 +2721,22 @@ export class PipelineRunner {
         bookDir,
         chapterNumber: targetChapter,
         baselineChapter,
-        allowNewHooks: options.allowNewHooks,
-        settlementGuidance,
+        allowNewHooks: context.allowNewHooks,
+        settlementGuidance: context.settlementGuidance,
         title: targetMeta.title,
         content,
-        reducedControlInput: reducedControlInput
+        reducedControlInput: context.chapterIntent || context.contextPackage || context.ruleStack
           ? {
-              chapterIntent: reducedControlInput.plan.intentMarkdown,
-              contextPackage: reducedControlInput.composed.contextPackage,
-              ruleStack: reducedControlInput.composed.ruleStack,
+              chapterIntent: context.chapterIntent,
+              contextPackage: context.contextPackage,
+              ruleStack: context.ruleStack,
             }
           : undefined,
         oldState,
         oldHooks,
         originalValidation: validation,
         previousSettlement: syncedOutput, recording, parentAttemptId: attemptId,
+        verifiedFeedback: Boolean(priorAttempt),
         language: pipelineLang,
         logWarn: (message) => this.logWarn(pipelineLang, message),
         logger: this.config.logger,
@@ -2744,7 +2756,7 @@ export class PipelineRunner {
     }
 
     try { this.currentAbortSignal()?.throwIfAborted(); } catch (error) {
-      throw Object.assign(new Error(String(error), { cause: error }), {
+      throw Object.assign(new Error(settlementErrorMessage(error), { cause: error }), {
         reasonCode: "SETTLEMENT_CANCELLED", stage: "commit", attemptId,
       });
     }
@@ -2812,7 +2824,7 @@ export class PipelineRunner {
       tokenUsage: targetMeta.tokenUsage,
     };
     }).catch(error => {
-      throw Object.assign(new Error(String(error), { cause: error }), {
+      throw Object.assign(new Error(settlementErrorMessage(error), { cause: error }), {
         ...settlementFailure(error), stage: (error as { stage?: string }).stage ?? "commit", attemptId,
       });
     });

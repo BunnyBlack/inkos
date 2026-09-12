@@ -541,5 +541,13 @@ describe("buildAgentSystemPrompt", () => {
       expect(buildAgentSystemPrompt(null, "en", "play", { playWorldExists: false })).toContain("the tool call itself is the answer");
       expect(buildAgentSystemPrompt(null, "en", "play", { playWorldExists: false })).toContain("do not add filler");
     });
+
+    it.each(["zh", "en"] as const)("directs settlement inspection toward the current candidate in %s", language => {
+      const prompt = buildAgentSystemPrompt("demo-book", language, "book");
+      expect(prompt).toContain("overview");
+      expect(prompt).toContain(language === "zh" ? "当前候选" : "current candidate");
+      expect(prompt).toContain(language === "zh" ? "语义分歧" : "semantic disagreement");
+      expect(prompt).toContain(language === "zh" ? "不要把父候选结论套到子候选" : "Do not apply a parent candidate conclusion to a child candidate");
+    });
   });
 });

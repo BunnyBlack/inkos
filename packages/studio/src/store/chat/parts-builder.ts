@@ -1,4 +1,5 @@
 import type { MessagePart, ToolExecution, PipelineStage } from "./types";
+import { operationOutcomesFromToolResult } from "@actalk/inkos-core/agent/operation-outcomes";
 import { localizeKnownRuntimeMessage } from "../../lib/error-copy";
 import { tr } from "../../lib/app-language";
 import { summarizeToolResult } from "../../shared/tool-result";
@@ -251,9 +252,22 @@ export function buildPartsFromEvents(events: StreamEvent[]): MessagePart[] {
         for (const p of parts) {
           if (p.type === "tool" && p.execution.id === event.id) {
             const exec = p.execution;
-            exec.status = event.isError ? "error" : "completed";
+            const operationOutcomes = operationOutcomesFromToolResult({
+              toolCallId: event.id,
+              toolName: exec.tool,
+              result: event.result,
+              details: event.details,
+              isError: Boolean(event.isError),
+            });
+            const businessFailure = operationOutcomes.some((outcome) => outcome.status === "failed" || outcome.status === "blocked");
+            exec.status = event.isError || businessFailure ? "error" : "completed";
             exec.completedAt = Date.now();
-            if (event.isError) exec.error = localizeKnownRuntimeMessage(summarizeToolResult(event.result));
+            if (event.isError || businessFailure) {
+              exec.error = event.isError
+                ? localizeKnownRuntimeMessage(summarizeToolResult(event.result))
+                : operationOutcomes.find((outcome) => outcome.status === "failed" || outcome.status === "blocked")?.reasonCode
+                  ?? tr("业务操作未完成", "Business operation did not complete");
+            }
             else exec.result = summarizeToolResult(event.result);
             if (event.details !== undefined) exec.details = event.details;
             if (!event.isError && (exec.tool === "play_start" || exec.tool === "play_step" || exec.tool === "play_revise")) {

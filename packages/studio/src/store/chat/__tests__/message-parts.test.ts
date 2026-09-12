@@ -227,6 +227,30 @@ describe("buildPartsFromEvents", () => {
     }
   });
 
+  it("marks a structured failed operation as an error when transport succeeded", () => {
+    const parts = buildPartsFromEvents([
+      { type: "tool:start", id: "repair", tool: "resume_settlement_attempt" },
+      {
+        type: "tool:end",
+        id: "repair",
+        result: "结算失败",
+        details: {
+          kind: "settlement_recovery",
+          bookId: "harbor",
+          chapterNumber: 2,
+          status: "failed",
+          reasonCode: "SETTLEMENT_NO_PROGRESS",
+        },
+      },
+    ]);
+
+    expect(parts[0].type).toBe("tool");
+    if (parts[0].type === "tool") {
+      expect(parts[0].execution.status).toBe("error");
+      expect(parts[0].execution.error).toBe("SETTLEMENT_NO_PROGRESS");
+    }
+  });
+
   it("preserves structured tool details for generated artifacts", () => {
     const details = {
       kind: "short_fiction_created",

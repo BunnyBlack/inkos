@@ -142,6 +142,30 @@ describe("file tools and conversational loop recovery", () => {
     expect(result.errorMessage).toMatch(/loop guard/i);
   });
 
+  it("commits the dialogue but retains failed settlement after a final promise without another call", async () => {
+    const attemptId = "11111111-1111-4111-8111-111111111111";
+    const resumeSettlementAttempt = vi.fn(async () => ({
+      status: "failed", chapterNumber: 1, attemptId, reasonCode: "SETTLEMENT_REPAIR_REQUIRED",
+    }));
+    const pipeline = { resumeSettlementAttempt,
+      runWithAgentContext: (_context: unknown, task: () => unknown) => task() } as any;
+    transport.reply = (i) => i === 0
+      ? call(i, "resume_settlement_attempt", { attemptId, action: "repair" })
+      : [{ type: "text", text: "I will try the repair again." }];
+    const result = await runAgentSession({ ...config(), pipeline }, "Repair the saved settlement.");
+    expect(resumeSettlementAttempt).toHaveBeenCalledTimes(1);
+    expect(transport.calls).toBe(2);
+    expect(result.responseText).toBe("I will try the repair again.");
+    expect(result.errorMessage).toBeUndefined();
+    expect(result.operationOutcomes).toEqual([expect.objectContaining({
+      bookId: "sample", chapterNumber: 1, status: "failed", attemptId,
+      reasonCode: "SETTLEMENT_REPAIR_REQUIRED",
+    })]);
+    const events = await readTranscriptEvents(root, sessionId);
+    expect(events.some((event) => event.type === "request_committed")).toBe(true);
+    expect(events.some((event) => event.type === "request_failed")).toBe(false);
+  });
+
   it("stops repeated schema failures before another model request", async () => {
     transport.reply = (i) => i < 12 ? call(i, "ls", { subdir: "chapters" }) : [{ type: "text", text: "Fallback." }];
     const result = await runAgentSession(config(), "List the directory.");

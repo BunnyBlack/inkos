@@ -141,6 +141,12 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
 } from "@actalk/inkos-core";
+import {
+  hasFailedOperationOutcomes,
+  mergeOperationOutcomes,
+  operationOutcomesFromToolResult,
+  type AgentOperationOutcome,
+} from "@actalk/inkos-core/agent/operation-outcomes";
 import { isConfirmedProductionAction } from "../shared/confirmed-production.js";
 import { summarizeToolResult } from "../shared/tool-result.js";
 import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -526,8 +532,13 @@ function resolveProjectTextArtifactFile(root: string, rawPath: string): { readon
 
 function isLikelyFailedToolResult(exec: CollectedToolExec): boolean {
   if (exec.status === "error") return true;
-  const text = `${exec.error ?? ""}\n${exec.result ?? ""}`.toLowerCase();
-  return /\bfailed\b|\berror\b|失败|异常|出错/.test(text);
+  return operationOutcomesFromToolResult({
+    toolCallId: exec.id,
+    toolName: exec.tool,
+    args: exec.args,
+    details: exec.details,
+    isError: false,
+  }).some((outcome) => outcome.status === "failed" || outcome.status === "blocked");
 }
 
 function hasSuccessfulSubAgentExec(
@@ -5232,6 +5243,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // 生产工具（提示词只是软约束）。
       const backgroundTask = await findActiveRunningTask(bookSession.sessionId);
       const collectedToolExecs: CollectedToolExec[] = [];
+      let collectedOperationOutcomes: AgentOperationOutcome[] = [];
       const result = await runAgentSession(
         {
           model,
@@ -5315,11 +5327,26 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             }
             if (event.type === "tool_execution_end") {
               const exec = collectedToolExecs.find(t => t.id === event.toolCallId);
+              const eventOutcomes = operationOutcomesFromToolResult({
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                args: exec?.args,
+                result: event.result,
+                isError: event.isError,
+                activeBookId: agentBookId,
+              });
+              collectedOperationOutcomes = mergeOperationOutcomes(collectedOperationOutcomes, eventOutcomes);
+              const businessFailure = eventOutcomes.some((outcome) => outcome.status === "failed" || outcome.status === "blocked");
               if (exec) {
-                exec.status = event.isError ? "error" : "completed";
+                exec.status = event.isError || businessFailure ? "error" : "completed";
                 exec.completedAt = Date.now();
                 exec.stages = exec.stages?.map(s => ({ ...s, status: "completed" as const }));
-                if (event.isError) exec.error = extractToolError(event.result);
+                if (event.isError || businessFailure) {
+                  exec.error = event.isError
+                    ? extractToolError(event.result)
+                    : eventOutcomes.find((outcome) => outcome.status === "failed" || outcome.status === "blocked")?.reasonCode
+                      ?? "Business operation did not complete.";
+                }
                 else exec.result = summarizeToolResult(event.result);
                 exec.details = (event.result as { details?: unknown } | undefined)?.details;
                 if (
@@ -5342,7 +5369,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
                 tool: event.toolName,
                 result: event.result,
                 details: exec?.details,
-                isError: event.isError,
+                isError: event.isError || businessFailure,
               });
             }
           },
@@ -5350,7 +5377,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         instruction,
       );
 
-      if (result.responseText) {
+      const operationOutcomes = mergeOperationOutcomes(collectedOperationOutcomes, result.operationOutcomes ?? []);
+      const businessFailure = hasFailedOperationOutcomes(operationOutcomes);
+
+      if (result.responseText && !businessFailure) {
         const actionExecutionError = validateAgentActionExecution({
           instruction,
           agentBookId,
@@ -5404,7 +5434,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       if (!result.responseText) {
         if (hasSuccessfulToolExec(collectedToolExecs, "propose_action")) {
           await refreshBookSessionFromTranscript();
-          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind });
+          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind, ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}) });
           return c.json({
             response: "",
             session: {
@@ -5412,7 +5442,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               sessionKind,
               ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
             },
-            details: { toolExecutions: collectedToolExecs },
+            details: { toolExecutions: collectedToolExecs, ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}) },
           });
         }
 
@@ -5424,7 +5454,24 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           return c.json({
             error: { code: failure.code, message: failure.message },
             response: failure.message,
+            ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}),
           }, failure.status);
+        }
+
+        if (businessFailure) {
+          await refreshBookSessionFromTranscript();
+          const responseSessionKind = bookSession.sessionKind ?? sessionKind;
+          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind, operationOutcomes });
+          return c.json({
+            response: result.responseText ?? "",
+            session: {
+              sessionId: bookSession.sessionId,
+              sessionKind: responseSessionKind,
+              ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
+            },
+            details: { toolExecutions: collectedToolExecs, operationOutcomes },
+            operationOutcomes,
+          });
         }
 
         const actionExecutionError = validateAgentActionExecution({
@@ -5445,7 +5492,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
         const createdBookId = await finalizeCreatedBook();
         if (requestedIntent || createdBookId || hasSuccessfulToolResult(collectedToolExecs)) {
           const responseSessionKind = bookSession.sessionKind ?? sessionKind;
-          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind });
+          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind, ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}) });
           return c.json({
             response: "",
             session: {
@@ -5453,7 +5500,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
               sessionKind: responseSessionKind,
               ...(createdBookId ?? bookSession.bookId ? { activeBookId: createdBookId ?? bookSession.bookId } : {}),
             },
-            details: { toolExecutions: collectedToolExecs },
+            details: { toolExecutions: collectedToolExecs, ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}) },
           });
         }
 
@@ -5474,7 +5521,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       await finalizeCreatedBook();
 
       const responseSessionKind = bookSession.sessionKind ?? sessionKind;
-      broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind });
+      broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind, ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}) });
 
       return c.json({
         response: hasSuccessfulToolOwnedResponse(collectedToolExecs) ? "" : result.responseText,
@@ -5483,6 +5530,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           sessionKind: responseSessionKind,
           ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
         },
+        ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}),
       });
     } catch (e) {
       if (e instanceof ApiError) {

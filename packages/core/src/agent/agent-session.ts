@@ -94,6 +94,10 @@ import {
 import { opaqueConversationId, runWithAgentTrajectory } from "../llm/agent-trajectory.js";
 import { guardedPiStream } from "./pi-stream.js";
 import { SessionLoopGuard } from "./session-loop-guard.js";
+import {
+  createOperationOutcomeCollector,
+  type OperationResultExtension,
+} from "./operation-outcomes.js";
 import type { LLMRuntimePolicy } from "../llm/runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -158,7 +162,7 @@ export interface AgentSessionConfig {
   recoveryOnly?: boolean;
 }
 
-export interface AgentSessionResult {
+export interface AgentSessionResult extends OperationResultExtension {
   /** Extracted text from the final assistant message. */
   responseText: string;
   /** Full raw Agent conversation history. */
@@ -1278,7 +1282,7 @@ async function runAgentSessionUnlocked(
       resolveProductionSkillActivations(skillResolution.availableSkills, capability)
     );
     const subAgentLoopGuard = createSubAgentLoopGuardState();
-    const loopGuard = new SessionLoopGuard();
+    const loopGuard = new SessionLoopGuard(bookId);
     const allowIntentSkillSelection = actionSource === "free-text"
       && skillResolution.forcedSkillIds.length === 0;
     const baseSystemPrompt = buildAgentSystemPrompt(bookId, language, sessionKind, {
@@ -1332,7 +1336,13 @@ async function runAgentSessionUnlocked(
           .map((tool) => ({
               ...tool,
               execute: async (...args: Parameters<typeof tool.execute>) => {
-                return loopGuard.executeTool(tool.name, args[0], args[1] as Record<string, unknown>, () => tool.execute(...args));
+                return loopGuard.executeTool(
+                  tool.name,
+                  args[0],
+                  args[1] as Record<string, unknown>,
+                  () => tool.execute(...args),
+                  args[2] as AbortSignal | undefined,
+                );
               },
             })),
         messages: initialAgentMessages,
@@ -1462,8 +1472,10 @@ async function runAgentSessionUnlocked(
   };
 
   // ----- Subscribe to events (transcript persistence + SSE forwarding) -----
+  const operationOutcomeCollector = createOperationOutcomeCollector(bookId);
   const unsubscribe = agent.subscribe(async (event: AgentEvent) => {
     cached.loopGuard.observe(event);
+    operationOutcomeCollector.observe(event);
     await persistAgentEvent(event);
     onEvent?.(event);
   });
@@ -1543,11 +1555,13 @@ async function runAgentSessionUnlocked(
   finalAssistant ??= lastAssistantMessage(allMessages);
   const responseText = finalAssistant ? extractTextFromAssistant(finalAssistant) : "";
   errorMessage ??= assistantErrorMessage(finalAssistant);
+  const operationOutcomes = operationOutcomeCollector.getOutcomes();
 
   return {
     responseText,
     messages: allMessages.slice(),
     ...(errorMessage ? { errorMessage } : {}),
+    ...(operationOutcomes.length > 0 ? { operationOutcomes } : {}),
   };
 }
 

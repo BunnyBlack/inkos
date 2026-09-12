@@ -51,11 +51,41 @@ function contextPipeline<T extends object>(pipeline: T): T & {
 describe("agent deterministic writing tools", () => {
   it("exposes settlement evidence and preserves bounded resume failure details", async () => {
     const pipeline = contextPipeline({
-      inspectSettlementAttempt: vi.fn(async () => ({ attempt: { attemptId: "attempt-one" }, events: [{ type: "validation-response" }] })),
+      inspectSettlementAttempt: vi.fn(async () => ({
+        attempt: {
+          version: 1,
+          attemptId: "11111111-1111-4111-8111-111111111111",
+          createdAt: "2026-09-12T00:00:00.000Z",
+          chapter: 1,
+          inputs: { sourceHash: "source", baselineHash: "baseline", controlHash: "control" },
+          context: { baselineChapter: 0 },
+          output: {
+            chapterNumber: 1,
+            title: "Candidate",
+            content: "Candidate body",
+          },
+          resumable: true,
+          status: "rejected",
+        },
+        events: [{
+          version: 1,
+          attemptId: "11111111-1111-4111-8111-111111111111",
+          eventId: "22222222-2222-4222-8222-222222222222",
+          sequence: 1,
+          recordedAt: "2026-09-12T00:00:01.000Z",
+          type: "validator-response",
+          data: { response: JSON.stringify({ issues: [{ description: "unverified" }] }) },
+        }],
+      })),
       resumeSettlementAttempt: vi.fn(async () => ({ status: "failed", attemptId: "attempt-one", chapterNumber: 1, reasonCode: "SETTLEMENT_NO_PROGRESS", issues: ["Unproven consent"], nextActions: ["inspect"] })),
     });
     const inspected = await createInspectSettlementAttemptTool(pipeline as any, "harbor").execute("i", { attemptId: "attempt-one" });
-    expect(inspected.details).toMatchObject({ attempt: { attemptId: "attempt-one" }, events: [{ type: "validation-response" }] });
+    expect(inspected.details).toMatchObject({ view: "overview", attemptId: "11111111-1111-4111-8111-111111111111", opinions: [{ description: "unverified", trustStatus: "unverified" }] });
+    expect(pipeline.inspectSettlementAttempt).toHaveBeenCalledWith("harbor", "attempt-one");
+    const candidate = await createInspectSettlementAttemptTool(pipeline as any, "harbor").execute("i2", { attemptId: "attempt-one", view: "candidate" });
+    expect(candidate.details).toMatchObject({ view: "candidate", candidate: { output: { content: "Candidate body" } } });
+    const diagnostics = await createInspectSettlementAttemptTool(pipeline as any, "harbor").execute("i3", { attemptId: "attempt-one", view: "diagnostics", limit: 1 });
+    expect(diagnostics.details).toMatchObject({ view: "diagnostics", limit: 1, events: [{ type: "validator-response" }] });
     const result = await createResumeSettlementAttemptTool(pipeline as any, "harbor").execute("r", { attemptId: "attempt-one", action: "revalidate" });
     expect(pipeline.resumeSettlementAttempt).toHaveBeenCalledWith("harbor", "attempt-one", "revalidate");
     expect(result.details).toMatchObject({ status: "failed", attemptId: "attempt-one", chapterNumber: 1, issues: ["Unproven consent"] });

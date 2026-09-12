@@ -4,6 +4,7 @@ import {
   clearPendingDecision,
   createLLMClient,
   RequestedIntentSchema,
+  hasFailedOperationOutcomes,
   runAgentSession,
   SessionKindSchema,
   type ActionPayload,
@@ -138,6 +139,17 @@ export async function processTuiAgentInput(params: {
   const responseText = proposedAction
     ? formatProposedAction(proposedAction, language)
     : result.responseText;
+  const businessFailure = hasFailedOperationOutcomes(result.operationOutcomes);
+  const outcomeExecutions = result.operationOutcomes?.map((outcome) => ({
+    id: outcome.toolCallId,
+    tool: "operation",
+    label: language === "en" ? "Business operation" : "业务操作",
+    status: outcome.status === "failed" || outcome.status === "blocked" ? "error" as const : "completed" as const,
+    details: outcome,
+    ...(outcome.reasonCode ? { error: outcome.reasonCode } : {}),
+    startedAt: userTimestamp,
+    completedAt: userTimestamp + 1,
+  }));
 
   const completedSession = {
     ...nextSession,
@@ -146,21 +158,24 @@ export async function processTuiAgentInput(params: {
     ...(activeBookId ? { activeBookId } : {}),
     ...(proposedAction ? { pendingProposedAction: proposedAction } : {}),
     currentExecution: {
-      status: "completed" as const,
+      status: businessFailure ? "failed" as const : "completed" as const,
       ...(activeBookId ? { bookId: activeBookId } : {}),
       ...(params.session.activeChapterNumber ? { chapterNumber: params.session.activeChapterNumber } : {}),
-      stageLabel: "agent",
+      stageLabel: businessFailure
+        ? language === "en" ? "Conversation ended; settlement incomplete" : "对话已结束，结算未完成"
+        : "agent",
     },
   };
 
-  if (responseText?.trim()) {
+  if (responseText?.trim() || outcomeExecutions?.length) {
     const lastAssistant = result.messages
       .filter((message: any) => message.role === "assistant")
       .at(-1) as { thinking?: string } | undefined;
     nextSession = appendInteractionMessage(completedSession, {
       role: "assistant",
-      content: responseText,
+      content: responseText ?? "",
       ...(lastAssistant?.thinking ? { thinking: lastAssistant.thinking } : {}),
+      ...(outcomeExecutions?.length ? { toolExecutions: outcomeExecutions } : {}),
       timestamp: userTimestamp + 1,
     });
   } else {

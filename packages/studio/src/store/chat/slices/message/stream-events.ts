@@ -1,4 +1,6 @@
 import type { StateCreator } from "zustand";
+import { hasFailedOperationOutcomes, operationOutcomesFromToolResult } from "@actalk/inkos-core/agent/operation-outcomes";
+import type { AgentOperationOutcome } from "@actalk/inkos-core/agent/operation-outcomes";
 import type { ChatStore, Message, MessageActions, MessagePart, PipelineStage, ToolExecution } from "../../types";
 import { shouldRefreshSidebarForTool } from "../../message-policy";
 import { tr } from "../../../../lib/app-language";
@@ -46,6 +48,12 @@ interface AttachSessionStreamListenersInput {
   get: SliceGet;
 }
 
+interface AgentCompleteEventPayload {
+  readonly sessionId?: unknown;
+  readonly activeBookId?: unknown;
+  readonly operationOutcomes?: unknown;
+}
+
 export const STREAM_TEXT_FLUSH_MS = 48;
 export const TOOL_PROGRESS_FLUSH_MS = 750;
 export const MAX_TOOL_LOGS = 80;
@@ -74,6 +82,77 @@ function numberOrZero(value: unknown): number {
 function eventExecutionId(data: unknown): string | undefined {
   const executionId = (data as { executionId?: unknown } | null)?.executionId;
   return typeof executionId === "string" && executionId ? executionId : undefined;
+}
+
+function isOperationOutcome(value: unknown): value is AgentOperationOutcome {
+  if (!value || typeof value !== "object") return false;
+  const outcome = value as Partial<AgentOperationOutcome>;
+  return typeof outcome.bookId === "string" && outcome.bookId.length > 0
+    && typeof outcome.toolCallId === "string" && outcome.toolCallId.length > 0
+    && ["applied", "unchanged", "failed", "blocked", "cancelled"].includes(outcome.status as string);
+}
+
+function operationOutcomesFromCompleteEvent(data: AgentCompleteEventPayload): AgentOperationOutcome[] {
+  return Array.isArray(data.operationOutcomes)
+    ? data.operationOutcomes.filter(isOperationOutcome)
+    : [];
+}
+
+/** Build the durable user-facing summary for a failed business operation. */
+export function buildBusinessFailureSummary(
+  outcomes: ReadonlyArray<AgentOperationOutcome>,
+): string {
+  const failures = outcomes.filter((outcome) => outcome.status === "failed" || outcome.status === "blocked");
+  if (!hasFailedOperationOutcomes(failures)) return "";
+  const details = [...new Set(failures.map((outcome) => {
+    const reason = outcome.reasonCode ?? outcome.status;
+    return outcome.attemptId
+      ? `${reason}${tr("；尝试：", "; attempt ID: ")}${outcome.attemptId}`
+      : reason;
+  }))].join(tr("；", "; "));
+  return tr(
+    `对话已结束，结算未完成（原因：${details}）`,
+    `Conversation ended; settlement incomplete (reason: ${details})`,
+  );
+}
+
+function messageExecutions(runtime: Pick<ChatStore["sessions"][string], "messages">): ToolExecution[] {
+  return runtime.messages.flatMap((message) => [
+    ...(message.toolExecutions ?? []),
+    ...(message.parts ?? []).flatMap((part) => part.type === "tool" ? [part.execution] : []),
+  ]);
+}
+
+function businessFailuresForChat(
+  data: AgentCompleteEventPayload,
+  runtime: Pick<ChatStore["sessions"][string], "bookId" | "messages">,
+  chatRound: boolean,
+): AgentOperationOutcome[] {
+  const eventBookId = typeof data.activeBookId === "string" && data.activeBookId
+    ? data.activeBookId
+    : runtime.bookId;
+  const executions = messageExecutions(runtime);
+  return operationOutcomesFromCompleteEvent(data).filter((outcome) => {
+    if (runtime.bookId && outcome.bookId !== runtime.bookId) return false;
+    if (eventBookId && outcome.bookId !== eventBookId) return false;
+    const execution = executions.find((item) => item.id === outcome.toolCallId);
+    // A listener attached for a production task must never append its failure
+    // summary to the chat transcript. A chat round that was reclassified as a
+    // background task is similarly identified by its background execution card.
+    if (!chatRound) return false;
+    if (execution?.background) return false;
+    return true;
+  });
+}
+
+function appendBusinessFailureSummary(
+  messages: ReadonlyArray<Message>,
+  summary: string,
+  streamTs: number,
+): ReadonlyArray<Message> {
+  if (!summary || messages.some((message) => message.timestamp >= streamTs
+    && message.role === "assistant" && message.content === summary)) return messages;
+  return [...messages, { role: "assistant", content: summary, timestamp: Date.now() }];
 }
 
 export function applyStreamTextDeltas(
@@ -257,6 +336,10 @@ export function attachSessionStreamListeners({
   set,
   get,
 }: AttachSessionStreamListenersInput): void {
+  // Capture the request kind when listeners are attached. Production task
+  // listeners also use this shared SSE endpoint, but their outcomes belong on
+  // the task card rather than in the conversational transcript.
+  const chatRound = get().sessions[sessionId]?.isChatStreaming === true;
   const textDeltaBatcher = createStreamTextDeltaBatcher((deltas) => {
     set((state) => ({
       sessions: updateSession(state.sessions, sessionId, (runtime) => {
@@ -329,12 +412,22 @@ export function attachSessionStreamListeners({
   //   等任务自己的终态事件（tool:end → agent:complete）到来再关闭。
   const finishSessionStream = (event: MessageEvent) => {
     try {
-      const data = event.data ? JSON.parse(event.data) : null;
+      const data = (event.data ? JSON.parse(event.data) : null) as AgentCompleteEventPayload | null;
       if (!sessionMatchesEvent(sessionId, data)) return;
       flushTextDeltas();
       flushProgressThrottles();
       const runtime = get().sessions[sessionId];
-      if (!runtime || runtime.isChatStreaming) return;
+      if (!runtime) return;
+      const failures = businessFailuresForChat(data ?? {}, runtime, chatRound);
+      if (failures.length > 0) {
+        const summary = buildBusinessFailureSummary(failures);
+        set((state) => ({
+          sessions: updateSession(state.sessions, sessionId, (current) => ({
+            messages: appendBusinessFailureSummary(current.messages, summary, streamTs),
+          })),
+        }));
+      }
+      if (runtime.isChatStreaming) return;
       if (hasAnyInFlightExecution(runtime.messages)) return;
       streamEs.close();
       set((state) => ({
@@ -541,14 +634,28 @@ export function attachSessionStreamListeners({
           // 按 execution id 全量定位：并行聊天时任务卡在更早的消息里
           const messages = updateToolPartById(runtime.messages, data.id as string, (previous) => {
             const execution = { ...previous };
-            execution.status = data.isError ? "error" : "completed";
+            const operationOutcomes = operationOutcomesFromToolResult({
+              toolCallId: data.id as string,
+              toolName: data.tool as string,
+              args: previous.args,
+              result: data.result,
+              details: data.details,
+              isError: Boolean(data.isError),
+            });
+            const businessFailure = operationOutcomes.some((outcome) => outcome.status === "failed" || outcome.status === "blocked");
+            execution.status = data.isError || businessFailure ? "error" : "completed";
             execution.completedAt = Date.now();
             execution.stages = execution.stages?.map((stage) =>
               stage.status !== "completed"
                 ? { ...stage, status: "completed" as const, progress: undefined }
                 : stage,
             );
-            if (data.isError) execution.error = extractToolError(data.result);
+            if (data.isError || businessFailure) {
+              execution.error = data.isError
+                ? extractToolError(data.result)
+                : operationOutcomes.find((outcome) => outcome.status === "failed" || outcome.status === "blocked")?.reasonCode
+                  ?? tr("业务操作未完成", "Business operation did not complete");
+            }
             else execution.result = summarizeResult(data.result);
             const details = data.details ?? extractToolDetails(data.result);
             if (details !== undefined) execution.details = details;

@@ -65,6 +65,9 @@ export class StateValidatorAgent extends BaseAgent {
     const langInstruction = language === "en"
       ? "Respond in English."
       : "用中文回答。";
+    const internalConflictInstruction = language === "en"
+      ? "For kind=internal-conflict, use only explicit contradictory facts already present in candidate-state and/or candidate-hooks, include at least two distinct candidate evidence quotes (the same source is allowed), and classify it as a candidate consistency repair only. Never invent chapter facts or use this kind to demand a change to the chapter or author settings."
+      : "对于 kind=internal-conflict，只能使用 candidate-state 和/或 candidate-hooks 中已经明确存在且互相矛盾的事实，至少提供两条不同的候选证据引用（允许来自同一来源），并且只能将其归类为候选一致性修复。绝不可补造正文事实，也不能借此要求修改正文或作者设定。";
 
     const systemPrompt = `You are a continuity validator for a novel writing system. ${langInstruction}
 
@@ -81,6 +84,7 @@ Output JSON: {"verdict":"PASS|REPAIR|FAIL","issues":[{"category":"contradiction"
 If no issues exist, legacy plain PASS is also accepted. Every blocking issue must include evidence. Quote full source text, not diff prefixes.
 For conflicts quote both the candidate and the chapter/baseline/authority fact. For omissions quote the explicit chapter fact and give the candidate target to check; do not invent a quote for absent text.
 Mark inferred or ambiguous interpretations as nonblocking observations, never explicit facts. If ambiguity prevents a reliable verdict, explain it for manual judgment rather than demand invented facts.
+${internalConflictInstruction}
 
 Verdict semantics:
 - PASS: the truth-file projection is complete enough and consistent with the chapter.
@@ -133,13 +137,13 @@ ${chapterContent}`;
         if (!result.passed && !result.issues?.some((issue) => issue.blocking)) {
           throw Object.assign(new Error("Blocking verdict requires structured grounded evidence."), { reasonCode: "VALIDATOR_EVIDENCE_INVALID" });
         }
-        if (result.issues) checkValidationEvidence(result.issues, sources);
+        if (result.issues) return { ...result, issues: checkValidationEvidence(result.issues, sources) };
         return result;
       } catch (error) {
         const reasonCode = (error as { reasonCode?: string }).reasonCode ?? "VALIDATOR_PROTOCOL_INVALID";
         if (attempt === 2) throw Object.assign(new Error(String(error), { cause: error }), { reasonCode, diagnosticPath });
         messages.push({ role: "assistant", content: response.content });
-        messages.push({ role: "user", content: `Correct only your validation protocol/evidence against the SAME candidate and sources. ${reasonCode}: ${String(error)}. Return the required structured verdict with exact source quotes. Reassess unsupported interpretations; do not invent facts, change the chapter, or edit the candidate. Do not infer consent from noticing deception or silence. This is the only correction attempt.` });
+        messages.push({ role: "user", content: `Correct only your validation protocol/evidence against the SAME candidate and sources. ${reasonCode}: ${String(error)}. Return the required structured verdict with exact source quotes. Reassess unsupported interpretations; do not invent facts, change the chapter, or edit the candidate. Do not infer consent from noticing deception or silence. For kind=internal-conflict, provide at least two distinct explicit quotes from candidate-state/candidate-hooks and use it only for candidate consistency repair; never add chapter facts. This is the only correction attempt.` });
       }
     }
     throw new Error("Validator correction budget exhausted");

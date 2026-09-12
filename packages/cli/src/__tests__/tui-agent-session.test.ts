@@ -30,6 +30,7 @@ vi.mock("@actalk/inkos-core", async () => {
   }
   return {
     ...actual,
+    hasFailedOperationOutcomes: (outcomes: any[] | undefined) => outcomes?.some((item) => item.status === "failed" || item.status === "blocked") ?? false,
     createLLMClient: vi.fn(() => ({
       _piModel: {
         id: "gpt-5.4",
@@ -90,6 +91,41 @@ describe("tui agent session bridge", () => {
     const persisted = await loadProjectSession(projectRoot);
     expect(persisted.currentExecution?.status).toBe("failed");
     expect(persisted.messages.at(-1)).toMatchObject({ role: "user", content: "Read the notes." });
+  });
+
+  it("keeps assistant text while persisting an incomplete business execution", async () => {
+    runAgentSessionMock.mockResolvedValueOnce({
+      responseText: "对话已结束，结算未完成。",
+      messages: [{ role: "assistant", content: "对话已结束，结算未完成。" }],
+      operationOutcomes: [{ bookId: "harbor", chapterNumber: 2, toolCallId: "repair", status: "failed", reasonCode: "SETTLEMENT_NO_PROGRESS" }],
+    });
+    const { processTuiAgentInput } = await import("../tui/agent-input.js");
+    const result = await processTuiAgentInput({
+      projectRoot, input: "继续结算", session: { ...createProjectSession(projectRoot), activeBookId: "harbor" }, activeBookId: "harbor",
+    });
+
+    expect(result.responseText).toContain("结算未完成");
+    expect(result.session.currentExecution?.status).toBe("failed");
+    expect(result.session.messages.at(-1)).toMatchObject({ role: "assistant", content: "对话已结束，结算未完成。" });
+  });
+
+  it("persists business outcome cards when the agent has no final text", async () => {
+    runAgentSessionMock.mockResolvedValueOnce({
+      responseText: "",
+      messages: [],
+      operationOutcomes: [{ bookId: "harbor", chapterNumber: 2, toolCallId: "repair", status: "failed", attemptId: "attempt-2", reasonCode: "SETTLEMENT_NO_PROGRESS" }],
+    });
+    const { processTuiAgentInput } = await import("../tui/agent-input.js");
+    const result = await processTuiAgentInput({
+      projectRoot, input: "继续结算", session: { ...createProjectSession(projectRoot), activeBookId: "harbor" }, activeBookId: "harbor",
+    });
+
+    expect(result.session.currentExecution?.status).toBe("failed");
+    expect(result.session.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "",
+      toolExecutions: [expect.objectContaining({ status: "error", details: expect.objectContaining({ attemptId: "attempt-2" }) })],
+    });
   });
 
   it("runs agent chat and persists raw assistant output into the tui session", async () => {

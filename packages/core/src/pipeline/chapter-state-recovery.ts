@@ -3,6 +3,7 @@ import type {
   ValidationResult,
   ValidationWarning,
 } from "../agents/state-validator.js";
+import { groundedValidationIssueSchema } from "../agents/state-validation-evidence.js";
 import type { StateValidatorAgent } from "../agents/state-validator.js";
 import type { WriteChapterOutput } from "../agents/writer.js";
 import type { WriterAgent } from "../agents/writer.js";
@@ -28,11 +29,63 @@ export async function captureSettlementRecording(bookDir: string, chapter: numbe
   return { inputs: await captureCandidateInputs(bookDir, chapter, context.settlementGuidance, Buffer.from(content, "utf8")), context, resumable };
 }
 
-export function settlementFailure(error: unknown): { reasonCode: string; stage: string; attemptId?: string; issues?: unknown; nextActions: string[] } {
-  const failure = error as { reasonCode?: string; stage?: string; attemptId?: string; issues?: unknown };
-  return { reasonCode: failure?.reasonCode ?? "CHAPTER_RECOVERY_FAILED", stage: failure?.stage ?? "settlement",
-    attemptId: failure?.attemptId, issues: failure?.issues,
-    nextActions: failure?.attemptId ? ["inspect-settlement", "revalidate", "repair"] : ["inspect-recovery"] };
+export type SettlementFailureKind = "protocol" | "evidence" | "content";
+
+function classifySettlementFailure(reasonCode: string, stage: string): SettlementFailureKind {
+  if (["VALIDATOR_EVIDENCE_INVALID", "SETTLEMENT_EVIDENCE_WRITE_FAILED"].includes(reasonCode)
+    || stage === "evidence") return "evidence";
+  if (["VALIDATOR_PROTOCOL_INVALID", "VALIDATOR_FEEDBACK_UNVERIFIED", "STATE_VALIDATION_FAILED"].includes(reasonCode)) return "protocol";
+  return "content";
+}
+
+export function settlementFailure(error: unknown): {
+  reasonCode: string; stage: string; attemptId?: string; issues?: unknown;
+  failureKind: SettlementFailureKind; diagnosticPath?: string; nextActions: string[];
+} {
+  const failure = error as {
+    reasonCode?: string; stage?: string; attemptId?: string; issues?: unknown; diagnosticPath?: unknown;
+  };
+  const reasonCode = failure?.reasonCode ?? "CHAPTER_RECOVERY_FAILED";
+  const stage = failure?.stage ?? "settlement";
+  const failureKind = classifySettlementFailure(reasonCode, stage);
+  const diagnosticPath = typeof failure?.diagnosticPath === "string" ? failure.diagnosticPath : undefined;
+  const protocolFailure = ["VALIDATOR_PROTOCOL_INVALID", "VALIDATOR_EVIDENCE_INVALID", "VALIDATOR_FEEDBACK_UNVERIFIED"]
+    .includes(reasonCode);
+  return { reasonCode, stage, attemptId: failure?.attemptId, issues: failure?.issues, failureKind,
+    ...(diagnosticPath ? { diagnosticPath } : {}),
+    nextActions: failure?.attemptId
+      ? protocolFailure ? ["inspect-settlement", "revalidate"] : ["inspect-settlement", "revalidate", "repair"]
+      : ["inspect-recovery"] };
+}
+
+/** Keep user-visible failures readable while preserving the original cause chain. */
+export function settlementErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
+  return String(error);
+}
+
+/** Only grounded, complete feedback may be passed to a repair writer. */
+export function hasCompleteRepairFeedbackShape(value: unknown): value is ValidationResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<ValidationResult>;
+  const warnings = result.warnings;
+  if (result.passed !== false || result.repairRequired !== true || !warnings || !Array.isArray(warnings)) return false;
+  if (warnings.some((warning) => !warning || typeof warning.category !== "string" || typeof warning.description !== "string")) return false;
+  const issues = result.issues;
+  if (!issues || !Array.isArray(issues) || issues.length === 0) return false;
+  return groundedValidationIssueSchema.array().safeParse(issues).success;
+}
+
+/** Reuse only an already committed PASS; malformed or blocking cached data is revalidated. */
+export function isReusablePassValidation(value: unknown): value is ValidationResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<ValidationResult>;
+  const warnings = result.warnings;
+  if (result.passed !== true || result.repairRequired === true || !warnings || !Array.isArray(warnings)
+    || warnings.some((warning) => !warning || typeof warning.category !== "string" || typeof warning.description !== "string")) return false;
+  const issues = result.issues;
+  return issues === undefined || (Array.isArray(issues) && issues.every((issue) => issue && typeof issue === "object" && issue.blocking !== true));
 }
 
 export function settlementMadeNoProgress(previous: WriteChapterOutput, next: WriteChapterOutput,
@@ -69,17 +122,25 @@ export async function validateRecordedSettlement(params: {
     return { attempt, validation };
   } catch (error) {
     const reasonCode = (error as { reasonCode?: string }).reasonCode ?? "STATE_VALIDATION_FAILED";
+    const stage = reasonCode === "SETTLEMENT_EVIDENCE_WRITE_FAILED" ? "evidence" : "validation";
+    const diagnosticPath = (error as { diagnosticPath?: unknown }).diagnosticPath;
+    const failureKind = classifySettlementFailure(reasonCode, stage);
     try {
-      await appendSettlementEvent(params.bookDir, attempt.attemptId, { type: "rejected", data: { reasonCode, error: String(error) } });
+      await appendSettlementEvent(params.bookDir, attempt.attemptId, { type: "rejected", data: {
+        reasonCode, error: settlementErrorMessage(error), failureKind,
+        ...(typeof diagnosticPath === "string" ? { diagnosticPath } : {}),
+      } });
     } catch (evidenceCause) {
       // The candidate already exists. Keep its identifier and both failures even
       // when the disk cannot accept the rejection event; never return validation.
       throw Object.assign(new Error("SETTLEMENT_EVIDENCE_WRITE_FAILED", { cause: error }), {
-        reasonCode: "SETTLEMENT_EVIDENCE_WRITE_FAILED", stage: "evidence", attemptId: attempt.attemptId, evidenceCause,
+        reasonCode: "SETTLEMENT_EVIDENCE_WRITE_FAILED", stage: "evidence", failureKind: "evidence",
+        attemptId: attempt.attemptId, evidenceCause,
       });
     }
-    throw Object.assign(new Error(String(error), { cause: error }), {
-      reasonCode, stage: reasonCode === "SETTLEMENT_EVIDENCE_WRITE_FAILED" ? "evidence" : "validation", attemptId: attempt.attemptId,
+    throw Object.assign(new Error(settlementErrorMessage(error), { cause: error }), {
+      reasonCode, stage, failureKind, attemptId: attempt.attemptId,
+      ...(typeof diagnosticPath === "string" ? { diagnosticPath } : {}),
     });
   }
 }
@@ -96,13 +157,15 @@ export interface SettlementRetryParams {
   readonly title: string;
   readonly content: string;
   readonly reducedControlInput?: {
-    chapterIntent: string;
-    contextPackage: ContextPackage;
-    ruleStack: RuleStack;
+    chapterIntent?: string;
+    contextPackage?: ContextPackage;
+    ruleStack?: RuleStack;
   };
   readonly oldState: string;
   readonly oldHooks: string;
   readonly originalValidation: ValidationResult;
+  /** Set by recovery after the saved candidate has been revalidated. */
+  readonly verifiedFeedback?: boolean;
   readonly previousSettlement?: WriteChapterOutput;
   readonly recording?: SettlementRecording;
   readonly parentAttemptId?: string;
@@ -135,6 +198,21 @@ export async function retrySettlementAfterValidationFailure(
     en: `State validation failed; retrying settlement only for chapter ${params.chapterNumber}`,
   });
 
+  if (params.originalValidation.repairRequired === false && !params.originalValidation.passed) {
+    return {
+      kind: "degraded",
+      issues: buildStateDegradedIssues(params.originalValidation.warnings, params.language),
+      attemptId: params.parentAttemptId,
+      reasonCode: "SETTLEMENT_REJECTED",
+      validation: params.originalValidation,
+    };
+  }
+  if (params.verifiedFeedback && !hasCompleteRepairFeedbackShape(params.originalValidation)) {
+    throw Object.assign(new Error("VALIDATOR_FEEDBACK_UNVERIFIED"), {
+      reasonCode: "VALIDATOR_FEEDBACK_UNVERIFIED", stage: "validation", failureKind: "protocol", attemptId: params.parentAttemptId,
+    });
+  }
+
   let retryOutput: WriteChapterOutput;
   if (params.parentAttemptId) await appendSettlementEvent(params.bookDir, params.parentAttemptId, { type: "settlement-request", data: {
     chapter: params.chapterNumber, baselineChapter: params.baselineChapter, content: params.content,
@@ -153,13 +231,10 @@ export async function retrySettlementAfterValidationFailure(
     chapterIntent: params.reducedControlInput?.chapterIntent,
     contextPackage: params.reducedControlInput?.contextPackage,
     ruleStack: params.reducedControlInput?.ruleStack,
-    validationFeedback: buildStateValidationFeedback(
-      params.originalValidation.warnings,
-      params.language,
-    ),
+    validationFeedback: buildStateValidationFeedback(params.originalValidation, params.language),
     previousSettlement: params.previousSettlement,
   }); } catch (error) {
-    throw Object.assign(new Error(String(error), { cause: error }), {
+    throw Object.assign(new Error(settlementErrorMessage(error), { cause: error }), {
       reasonCode: (error as { reasonCode?: string }).reasonCode ?? "SETTLEMENT_GENERATION_FAILED",
       stage: "settlement", attemptId: params.parentAttemptId,
     });
@@ -186,7 +261,7 @@ export async function retrySettlementAfterValidationFailure(
       params.authorityContext,
     );
   } catch (error) {
-    throw Object.assign(new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${String(error)}`, { cause: error }), settlementFailure(error));
+    throw Object.assign(new Error(`State validation retry failed for chapter ${params.chapterNumber}: ${settlementErrorMessage(error)}`, { cause: error }), settlementFailure(error));
   }
 
   if (retryValidation.warnings.length > 0) {
@@ -221,14 +296,35 @@ export async function retrySettlementAfterValidationFailure(
 }
 
 export function buildStateValidationFeedback(
-  warnings: ReadonlyArray<ValidationWarning>,
+  validationOrWarnings: ValidationResult | ReadonlyArray<ValidationWarning>,
   language: LengthLanguage,
 ): string {
-  if (warnings.length === 0) {
-    return language === "en"
-      ? "The previous settlement contradicted the chapter text. Reconcile truth files strictly to the body."
-      : "上一次状态结算与正文矛盾。请严格以正文为准修正 truth files。";
+  const isWarnings = (value: ValidationResult | ReadonlyArray<ValidationWarning>): value is ReadonlyArray<ValidationWarning> => Array.isArray(value);
+  const validation = isWarnings(validationOrWarnings) ? undefined : validationOrWarnings;
+  const warnings: ReadonlyArray<ValidationWarning> = validation
+    ? validation.warnings
+    : validationOrWarnings as ReadonlyArray<ValidationWarning>;
+  const issues = validation?.issues ?? [];
+  if (issues.length > 0) {
+    const rendered = issues.map((issue) => {
+      const evidence = issue.evidence.length > 0
+        ? issue.evidence.map((item) => `${item.source}: ${item.quote}`).join(language === "en" ? " | " : "；")
+        : language === "en" ? "(no source quote)" : "（无原文引文）";
+      const status = issue.blocking
+        ? language === "en" ? "blocking" : "阻断"
+        : language === "en" ? "observation; do not invent facts" : "观察；不得臆造事实";
+      return language === "en"
+        ? `- [${issue.category}] ${status} (${issue.kind}/${issue.basis}): ${issue.description}\n  Rationale: ${issue.rationale}\n  Target: ${issue.target ?? "none"}\n  Evidence: ${evidence}`
+        : `- [${issue.category}] ${status}（${issue.kind}/${issue.basis}）：${issue.description}\n  理由：${issue.rationale}\n  目标：${issue.target ?? "无"}\n  证据：${evidence}`;
+    });
+    return [
+      language === "en"
+        ? "The previous settlement failed validation. Address only the grounded feedback below against the unchanged chapter body:"
+        : "上一次状态结算未通过校验。请仅依据以下有原文依据的反馈，对照未改变的正文处理：",
+      ...rendered,
+    ].join("\n");
   }
+  if (warnings.length === 0) return "";
 
   if (language === "en") {
     return [

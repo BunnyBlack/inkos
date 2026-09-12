@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as fs from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { validateRecordedSettlement, retrySettlementAfterValidationFailure, settlementFailure } from "../pipeline/chapter-state-recovery.js";
+import { validateRecordedSettlement, retrySettlementAfterValidationFailure, settlementFailure, buildStateValidationFeedback } from "../pipeline/chapter-state-recovery.js";
 import { listSettlementAttempts, loadSettlementAttempt, readSettlementEvents, createSettlementAttempt, appendSettlementEvent } from "../pipeline/settlement-attempt.js";
 import type { WriteChapterOutput } from "../agents/writer.js";
 
@@ -26,6 +26,46 @@ beforeEach(async () => {
   await fs.writeFile(join(book, "chapters", "0001_retained.md"), "retained body\r\n", "utf8");
 });
 afterEach(async () => { vi.restoreAllMocks(); await fs.rm(book, { recursive: true, force: true }); });
+
+it("renders grounded issue details without turning observations into repair commands", () => {
+  const feedback = buildStateValidationFeedback({
+    passed: false,
+    repairRequired: true,
+    warnings: [{ category: "observation", description: "The token may be missing." }],
+    issues: [{ category: "observation", description: "The token may be missing.", blocking: false,
+      kind: "observation", basis: "ambiguous", rationale: "The chapter leaves the detail unresolved.",
+      evidence: [{ source: "chapter", quote: "retained body" }] }],
+  }, "en");
+  expect(feedback).toContain("observation; do not invent facts");
+  expect(feedback).toContain("ambiguous");
+  expect(feedback).toContain("chapter: retained body");
+  expect(feedback).not.toContain("Fix these contradictions");
+  expect(buildStateValidationFeedback({ passed: false, repairRequired: true, warnings: [] }, "en")).toBe("");
+});
+
+it("records classified validator diagnostics and stops blind repair for protocol failures", async () => {
+  const validatorFailure = Object.assign(new Error("protocol response invalid"), {
+    reasonCode: "VALIDATOR_PROTOCOL_INVALID", diagnosticPath: "diagnostics/validator-2-response.json",
+  });
+  const result = await validateRecordedSettlement({
+    validator: { validate: vi.fn(async () => { throw validatorFailure; }) },
+    bookDir: book, chapterNumber: 1, content: output.content, output,
+    oldState: "published state", oldHooks: "old hooks", language: "en",
+    recording: { inputs: { sourceHash: "source", baselineHash: "baseline", controlHash: "control" }, resumable: true, context: { baselineChapter: 0 } },
+  }).then(() => { throw new Error("Must not return protocol failure as validation"); }, error => error);
+
+  const attempts = await listSettlementAttempts(book);
+  const events = await readSettlementEvents(book, attempts[0]!.attemptId);
+  expect(result).toMatchObject({ reasonCode: "VALIDATOR_PROTOCOL_INVALID", stage: "validation",
+    failureKind: "protocol", diagnosticPath: validatorFailure.diagnosticPath, attemptId: attempts[0]!.attemptId });
+  expect(result.message).toBe("protocol response invalid");
+  expect(events.at(-1)).toMatchObject({ type: "rejected", data: {
+    reasonCode: "VALIDATOR_PROTOCOL_INVALID", error: "protocol response invalid", failureKind: "protocol",
+    diagnosticPath: validatorFailure.diagnosticPath,
+  } });
+  expect(settlementFailure(result)).toMatchObject({ reasonCode: "VALIDATOR_PROTOCOL_INVALID", failureKind: "protocol",
+    diagnosticPath: validatorFailure.diagnosticPath, nextActions: ["inspect-settlement", "revalidate"] });
+});
 
 it.each(["automatic-retry", "direct-append"] as const)("keeps the latest child ID when the final %s rejection log cannot be saved", async path => {
   const recording = { inputs: { sourceHash: "source", baselineHash: "baseline", controlHash: "control" }, resumable: true, context: { baselineChapter: 0 } };

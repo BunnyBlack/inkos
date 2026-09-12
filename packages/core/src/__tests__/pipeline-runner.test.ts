@@ -15,6 +15,7 @@ import { ContinuityAuditor, type AuditIssue, type AuditResult } from "../agents/
 import { ReviserAgent, type ReviseOutput } from "../agents/reviser.js";
 import { ChapterAnalyzerAgent } from "../agents/chapter-analyzer.js";
 import { StateValidatorAgent } from "../agents/state-validator.js";
+import type { ValidationResult } from "../agents/state-validator.js";
 import {
   FoundationReviewerAgent,
   FoundationReviewParseError,
@@ -30,6 +31,8 @@ import {
   readChapterVersion,
   saveChapterUserBrief,
 } from "../state/chapter-workspace.js";
+import { appendSettlementEvent, createSettlementAttempt } from "../pipeline/settlement-attempt.js";
+import { captureCandidateInputs } from "../pipeline/recovery-candidate.js";
 
 const require = createRequire(import.meta.url);
 vi.mock("node:fs/promises", async original => {
@@ -3130,7 +3133,7 @@ describe("PipelineRunner", () => {
       expect(settle).toHaveBeenCalledTimes(2);
       expect(settle.mock.calls[1][0].previousSettlement).toMatchObject({ content: "Original body" });
       expect(await runner.resumeSettlementAttempt(bookId, failure.attemptId, "revalidate")).toMatchObject({
-        status: "failed", reasonCode: "SETTLEMENT_NO_PROGRESS", failedChapter: 1,
+        status: "failed", reasonCode: "SETTLEMENT_REPAIR_REQUIRED", failedChapter: 1,
       });
       validate.mockResolvedValue({ passed: true, warnings: [] });
       const resumed = await (runner as any).resumeSettlementAttempt(bookId, failure.attemptId, "revalidate");
@@ -3139,6 +3142,232 @@ describe("PipelineRunner", () => {
       expect(await readFile(bodyPath, "utf8")).toBe("Original body");
       expect((await (runner as any).resumeSettlementAttempt(bookId, failure.attemptId, "revalidate")).status).toBe("unchanged");
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("revalidates an old rejected candidate before repair and publishes PASS without calling the writer", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      const bodyPath = join(bookDir, "chapters", "0001_Broken.md");
+      await writeFile(bodyPath, body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const inputs = await captureCandidateInputs(bookDir, 1);
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1,
+        inputs,
+        output: candidate,
+        context: { baselineChapter: 0 },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, {
+        type: "rejected",
+        data: { reasonCode: "VALIDATOR_PROTOCOL_INVALID", error: "State validator returned invalid response" },
+      });
+
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState);
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, warnings: [] });
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "repair");
+
+      expect(result).toMatchObject({ status: "applied", chapterNumber: 1 });
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(settle).not.toHaveBeenCalled();
+      expect(await readFile(bodyPath, "utf8")).toBe(body);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes complete verified REPAIR feedback to one writer call after revalidation", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      const bodyPath = join(bookDir, "chapters", "0001_Broken.md");
+      await writeFile(bodyPath, body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1, inputs: await captureCandidateInputs(bookDir, 1, "saved guidance"), output: candidate, context: {
+          baselineChapter: 0,
+          settlementGuidance: "saved guidance",
+          allowNewHooks: false,
+          chapterIntent: "saved chapter intent",
+          contextPackage: { chapter: 1, selectedContext: [{ source: "saved source", reason: "saved reason" }] },
+          ruleStack: { layers: [{ id: "saved-layer", name: "Saved layer", precedence: 1, scope: "book" }],
+            sections: { hard: ["saved hard rule"], soft: [], diagnostic: [] }, overrideEdges: [], activeOverrides: [] },
+        },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, {
+        type: "rejected", data: { reasonCode: "VALIDATOR_PROTOCOL_INVALID", error: "old diagnostic only" },
+      });
+
+      const feedback: ValidationResult = {
+        passed: false,
+        repairRequired: true,
+        warnings: [{ category: "missing_state_update", description: "Add the explicit state change." }],
+        issues: [{
+          category: "missing_state_update", description: "Add the explicit state change.", blocking: true,
+          kind: "omission", basis: "explicit", rationale: "The chapter states the change.", target: "candidate-state",
+          evidence: [{ source: "chapter", quote: "Original body" }],
+        }],
+      };
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState).mockImplementation(async input =>
+        createWriterOutput({ chapterNumber: input.chapterNumber, title: input.title, content: input.content }),
+      );
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate)
+        .mockResolvedValueOnce(feedback)
+        .mockResolvedValueOnce({ passed: true, warnings: [] });
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "repair");
+
+      expect(result).toMatchObject({ status: "applied", chapterNumber: 1 });
+      expect(validate).toHaveBeenCalledTimes(2);
+      expect(settle).toHaveBeenCalledTimes(1);
+      expect(settle.mock.calls[0]?.[0]).toMatchObject({
+        content: "Original body",
+        settlementGuidance: "saved guidance",
+        allowNewHooks: false,
+        chapterIntent: "saved chapter intent",
+        contextPackage: { chapter: 1, selectedContext: [{ source: "saved source", reason: "saved reason" }] },
+        ruleStack: { layers: [{ id: "saved-layer" }] },
+        validationFeedback: expect.stringContaining("Add the explicit state change."),
+      });
+      expect(settle.mock.calls[0]?.[0].validationFeedback).toContain("chapter: Original body");
+      expect(await readFile(bodyPath, "utf8")).toBe(body);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("revalidates a cached PASS that contains a blocking issue instead of trusting the cache", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      await writeFile(join(bookDir, "chapters", "0001_Broken.md"), body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1, inputs: await captureCandidateInputs(bookDir, 1), output: candidate, context: { baselineChapter: 0 },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, {
+        type: "validated",
+        data: { passed: true, warnings: [], issues: [{ category: "conflict", description: "blocking cached issue", blocking: true,
+          kind: "conflict", basis: "explicit", rationale: "cached data must be checked", evidence: [] }] },
+      });
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({ passed: true, warnings: [] });
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState);
+
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "revalidate");
+      expect(result).toMatchObject({ status: "applied", chapterNumber: 1 });
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(settle).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stops an old rejected candidate on verified FAIL without calling the writer", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      const bodyPath = join(bookDir, "chapters", "0001_Broken.md");
+      await writeFile(bodyPath, body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1, inputs: await captureCandidateInputs(bookDir, 1), output: candidate, context: { baselineChapter: 0 },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, { type: "rejected", data: { reasonCode: "OLD_FAIL", error: "old diagnostic" } });
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState);
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate).mockResolvedValue({
+        passed: false, repairRequired: false, warnings: [{ category: "conflict", description: "Hard contradiction." }],
+        issues: [{ category: "conflict", description: "Hard contradiction.", blocking: true, kind: "conflict", basis: "explicit",
+          rationale: "The candidate conflicts with the chapter.", evidence: [{ source: "candidate-state", quote: "candidate" }, { source: "chapter", quote: "Original body" }] }],
+      });
+
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "repair");
+      expect(result).toMatchObject({ status: "failed", reasonCode: "SETTLEMENT_REJECTED", stage: "validation" });
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(settle).not.toHaveBeenCalled();
+      expect(await readFile(bodyPath, "utf8")).toBe(body);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not call the writer when revalidation protocol fails for an old rejected candidate", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      const bodyPath = join(bookDir, "chapters", "0001_Broken.md");
+      await writeFile(bodyPath, body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1, inputs: await captureCandidateInputs(bookDir, 1), output: candidate, context: { baselineChapter: 0 },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, { type: "rejected", data: { reasonCode: "OLD_PROTOCOL", error: "old diagnostic" } });
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState);
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate).mockRejectedValue(
+        Object.assign(new Error("State validator returned invalid response"), { reasonCode: "VALIDATOR_PROTOCOL_INVALID" }),
+      );
+
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "repair");
+      expect(result).toMatchObject({ status: "failed", reasonCode: "VALIDATOR_PROTOCOL_INVALID", stage: "validation" });
+      expect(validate).toHaveBeenCalledTimes(1);
+      expect(settle).not.toHaveBeenCalled();
+      expect(result.error).toBe("State validator returned invalid response");
+      expect(await readFile(bodyPath, "utf8")).toBe(body);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects changed inputs before validating or repairing an old candidate", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    try {
+      const bookDir = state.bookDir(bookId);
+      const now = new Date().toISOString();
+      const body = "# Chapter 1: Broken\n\nOriginal body";
+      await state.saveChapterIndex(bookId, [{ number: 1, title: "Broken", status: "state-degraded", wordCount: 2,
+        createdAt: now, updatedAt: now, auditIssues: [], lengthWarnings: [] }]);
+      const bodyPath = join(bookDir, "chapters", "0001_Broken.md");
+      await writeFile(bodyPath, body, "utf8");
+      const candidateContent = "Original body";
+      const candidate = createWriterOutput({ chapterNumber: 1, title: "Broken", content: candidateContent, wordCount: candidateContent.length });
+      const prior = await createSettlementAttempt(bookDir, {
+        chapter: 1, inputs: await captureCandidateInputs(bookDir, 1), output: candidate, context: { baselineChapter: 0 },
+      });
+      await appendSettlementEvent(bookDir, prior.attemptId, { type: "rejected", data: { reasonCode: "OLD_REJECTED", error: "old diagnostic" } });
+      await writeFile(bodyPath, "# Chapter 1: Broken\n\nChanged body", "utf8");
+      const settle = vi.mocked(WriterAgent.prototype.settleChapterState);
+      const validate = vi.mocked(StateValidatorAgent.prototype.validate);
+
+      const result = await runner.resumeSettlementAttempt(bookId, prior.attemptId, "repair");
+      expect(result).toMatchObject({ status: "failed", reasonCode: "SETTLEMENT_INPUTS_CHANGED", stage: "preflight" });
+      expect(validate).not.toHaveBeenCalled();
+      expect(settle).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("reports the new resume candidate when its final rejection log fails and releases the lock", async () => {
@@ -3153,7 +3382,11 @@ describe("PipelineRunner", () => {
       await writeFile(bodyPath, "Original body", "utf8");
       vi.spyOn(WriterAgent.prototype, "settleChapterState").mockImplementation(async input => createSettledRevisionOutput(input));
       vi.spyOn(StateValidatorAgent.prototype, "validate").mockResolvedValue({ passed: false, repairRequired: true,
-        warnings: [{ category: "missing", description: "Missing state fact" }] });
+        warnings: [{ category: "missing", description: "Missing state fact" }],
+        issues: [{ category: "missing", description: "Missing state fact", blocking: true, kind: "omission", basis: "explicit",
+          rationale: "The chapter contains the missing fact.", target: "candidate-state",
+          evidence: [{ source: "chapter", quote: "Original body" }] }],
+      });
       const parent = await runner.recoverChapters(bookId, 1);
       expect(parent.attemptId).toEqual(expect.any(String));
       const beforeState = await readFile(join(bookDir, "story/current_state.md"));

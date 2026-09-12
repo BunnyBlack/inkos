@@ -26,14 +26,14 @@ function commonOutputRules(isZh: boolean): string {
 - 普通讨论要直接回答；明确需要调用工具时，工具调用本身就是回答，不要先写寒暄、理解说明或空泛确认。
 - 需要结构时用短列表；不要虚报工具执行结果。
 - 修订未应用或状态结算失败时，保留候选并报告恢复步骤；不要改写 current_state、pending_hooks、摘要、结构化状态、快照或恢复记录来绕过失败。作者设定仍可通过设定编辑工具修改。
-- 结算失败后先用 recovery_status 和 inspect_settlement_attempt 查看完整候选、证据和所有问题；用户要求继续时使用 resume_settlement_attempt 的 revalidate 或 repair。校验意见必须对照正文核实，不能默认把推断写入角色设定来解锁。遇到 SETTLEMENT_NO_PROGRESS 应停止本轮重试并说明分歧；新的用户请求可以重新续接。`
+- 结算失败后先用 recovery_status 和 inspect_settlement_attempt；默认使用 overview 聚焦当前候选的最新结果、全部意见和 trust 状态，需要正文时用 candidate，需要完整请求/回复事件时用 diagnostics 分页。总结当前候选的最新结果，概述所有阻断类别；对语义分歧明确说明待确认。不要把父候选结论套到子候选。校验意见必须对照正文核实，不能默认把推断写入角色设定来解锁。遇到 SETTLEMENT_NO_PROGRESS 应停止本轮重试并说明分歧；新的用户请求可以重新续接。`
     : `## Output Rules
 
 - Do not use emoji.
 - Answer ordinary discussion directly. When a tool call is needed, the tool call itself is the answer; do not add filler, acknowledgement, or a plain-text confirmation first.
 - Use short bullets when structure helps; do not claim side effects without successful tool results.
 - When revision is unapplied or settlement fails, preserve the candidate and report recovery steps. Never overwrite current_state, pending_hooks, summaries, structured state, snapshots or recovery records to bypass failure. Author canon remains editable through canon tools.
-- After settlement failure, use recovery_status and inspect_settlement_attempt for the full candidate, evidence and issues. When the user requests continuation, use resume_settlement_attempt with revalidate or repair. Verify feedback against chapter text; never default to adding inferred facts to character canon to unblock validation. Stop this turn on SETTLEMENT_NO_PROGRESS and explain the disagreement; a new user request may resume again.`;
+- After settlement failure, use recovery_status and inspect_settlement_attempt; use the default overview to focus on the current candidate's latest result, all opinions, and trust status, candidate when the body is needed, and paged diagnostics for complete request/response events. Summarize the current candidate's latest result and all blocking categories; mark semantic disagreement as requiring confirmation. Do not apply a parent candidate conclusion to a child candidate. Verify feedback against chapter text; never default to adding inferred facts to character canon to unblock validation. Stop this turn on SETTLEMENT_NO_PROGRESS and explain the disagreement; a new user request may resume again.`;
 }
 
 function buildChatPrompt(isZh: boolean): string {

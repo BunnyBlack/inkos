@@ -36,6 +36,17 @@ export {
   type AgentSessionResult,
 } from "./agent-session.js";
 export {
+  AGENT_OPERATION_STATUSES,
+  OperationOutcomeCollector,
+  createOperationOutcomeCollector,
+  hasFailedOperationOutcomes,
+  mergeOperationOutcomes,
+  operationOutcomesFromToolResult,
+  type AgentOperationOutcome,
+  type AgentOperationStatus,
+  type OperationResultExtension,
+} from "./operation-outcomes.js";
+export {
   createBookContextTransform,
   createInteractiveFilmContextTransform,
 } from "./context-transform.js";

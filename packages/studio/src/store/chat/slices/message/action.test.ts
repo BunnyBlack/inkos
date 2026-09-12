@@ -171,6 +171,27 @@ describe("chat message actions", () => {
     expect(store.getState().sessionIdsByBook["new-book"]).toContain(sessionId);
   });
 
+  it("persists a settlement failure summary from an empty HTTP completion", async () => {
+    const store = createTestStore();
+    const sessionId = store.getState().createDraftSession("demo-book", "book");
+    store.getState().setSelectedModel("deepseek-v4-flash", "kkaiapi");
+    fetchJson
+      .mockResolvedValueOnce({ session: { sessionId, bookId: "demo-book", sessionKind: "book" } })
+      .mockResolvedValueOnce({
+        response: "",
+        session: { sessionId, bookId: "demo-book", sessionKind: "book" },
+        operationOutcomes: [{ bookId: "demo-book", chapterNumber: 1, toolCallId: "settle-1",
+          status: "failed", reasonCode: "SETTLEMENT_REPAIR_REQUIRED", attemptId: "attempt-http" }],
+      });
+
+    await store.getState().sendMessage(sessionId, "继续结算");
+
+    const messages = store.getState().sessions[sessionId]?.messages ?? [];
+    expect(messages.some((message) => message.content.includes("对话已结束，结算未完成"))).toBe(true);
+    expect(messages.some((message) => message.content.includes("模型未返回文本内容"))).toBe(false);
+    expect(messages.at(-1)?.content).toContain("attempt-http");
+  });
+
   it("sends the session-bound book id when no explicit activeBookId option is provided", async () => {
     const store = createTestStore();
     const sessionId = store.getState().createDraftSession("harbor-book", "book");

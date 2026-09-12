@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createEditTool, createLsTool, createReadTool, createWriteFileTool, createWriteTruthFileTool } from "../agent/agent-tools.js";
 import { SessionLoopGuard } from "../agent/session-loop-guard.js";
-import { operationResultFailed } from "../agent/operation-policy.js";
+import { mutationBookId, operationResultFailed } from "../agent/operation-policy.js";
 import { StateManager } from "../state/manager.js";
 import { createInteractionToolsFromDeps } from "../interaction/project-tools.js";
 
@@ -81,6 +81,176 @@ it("counts recovery and settlement resume against the actual failed chapter", ()
   }
   expect(() => guard.beforeModelCall()).toThrow(/loop guard/);
   guard.reset();
+  expect(() => guard.beforeModelCall()).not.toThrow();
+});
+
+it("identifies mutation books from constrained tools and paths", () => {
+  expect(mutationBookId("patch_chapter_text", { bookId: "forged" }, "active")).toBe("active");
+  expect(mutationBookId("write_truth_file", {}, "active")).toBe("active");
+  expect(mutationBookId("sub_agent", { agent: "writer", bookId: "forged" }, "active")).toBe("active");
+  expect(mutationBookId("write", { path: "other/story/notes.md" }, "active")).toBe("other");
+  expect(mutationBookId("write", { path: "./other/story/notes.md" }, "active")).toBe("other");
+  expect(mutationBookId("edit", { path: ".\\other\\story\\notes.md" }, "active")).toBe("other");
+  expect(mutationBookId("edit", { path: "active/chapters/0001.md" }, "active")).toBe("active");
+  expect(mutationBookId("write", { path: "../outside.md" }, "active")).toBeUndefined();
+  expect(mutationBookId("sub_agent", { agent: "architect", title: "new book" }, "active")).toBeUndefined();
+});
+
+it("serializes same-book tool execution without delaying different books", async () => {
+  const guard = new SessionLoopGuard();
+  let activeWrites = 0;
+  let maxActiveWrites = 0;
+  const entered: string[] = [];
+  const barriers = new Map<string, { promise: Promise<void>; release: () => void }>();
+  for (const id of ["same-1", "same-2", "other-1"]) {
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => { release = resolve; });
+    barriers.set(id, { promise, release });
+  }
+  const run = (id: string, bookId: string) => guard.executeTool(
+    "patch_chapter_text",
+    id,
+    { bookId },
+    async () => {
+      activeWrites += 1;
+      maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
+      entered.push(id);
+      await barriers.get(id)!.promise;
+      activeWrites -= 1;
+      return id;
+    },
+  );
+  const first = run("same-1", "same");
+  const second = run("same-2", "same");
+  const other = run("other-1", "other");
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(entered).toEqual(["same-1", "other-1"]);
+  expect(maxActiveWrites).toBe(2);
+  barriers.get("other-1")!.release();
+  await other;
+  expect(entered).toEqual(["same-1", "other-1"]);
+  barriers.get("same-1")!.release();
+  await first;
+  await Promise.resolve();
+  expect(entered).toEqual(["same-1", "other-1", "same-2"]);
+  barriers.get("same-2")!.release();
+  await second;
+  expect(maxActiveWrites).toBe(2);
+});
+
+it.each([
+  ["sub_agent", { agent: "writer" }],
+  ["sub_agent", { agent: "auditor" }],
+  ["import_chapters", {}],
+  ["continuation_import", {}],
+])("shares the same queue between a patch and %s %j", async (toolName, toolArgs) => {
+  const guard = new SessionLoopGuard("active");
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const entered: string[] = [];
+  const patch = guard.executeTool(
+    "patch_chapter_text",
+    "patch",
+    { bookId: "forged" },
+    async () => {
+      entered.push("patch");
+      await firstGate;
+      return "patched";
+    },
+  );
+  const production = guard.executeTool(
+    toolName,
+    "production",
+    { ...toolArgs, bookId: "forged" },
+    async () => {
+      entered.push("production");
+      return "produced";
+    },
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(entered).toEqual(["patch"]);
+  releaseFirst();
+  await expect(patch).resolves.toBe("patched");
+  await expect(production).resolves.toBe("produced");
+  expect(entered).toEqual(["patch", "production"]);
+});
+
+it("continues the same-book queue after a patch failure", async () => {
+  const guard = new SessionLoopGuard();
+  const first = guard.executeTool("patch_chapter_text", "failed", { bookId: "same" }, async () => {
+    throw new Error("target not found");
+  });
+  const second = guard.executeTool("patch_chapter_text", "next", { bookId: "same" }, async () => "next result");
+  await expect(first).rejects.toThrow("target not found");
+  await expect(second).resolves.toBe("next result");
+  expect(() => guard.beforeModelCall()).not.toThrow();
+});
+
+it("keeps patch failures out of the chapter production budget", async () => {
+  const guard = new SessionLoopGuard("same");
+  const failedPatch = guard.executeTool("patch_chapter_text", "patch", {}, async () => {
+    throw new Error("target not found");
+  });
+  await expect(failedPatch).rejects.toThrow("target not found");
+  expect(() => guard.beforeToolExecution("sub_agent", { agent: "writer" })).not.toThrow();
+});
+
+it("does not execute a queued mutation after cancellation", async () => {
+  const guard = new SessionLoopGuard();
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let executions = 0;
+  const first = guard.executeTool("patch_chapter_text", "first", { bookId: "same" }, async () => {
+    executions += 1;
+    await firstGate;
+    return "first";
+  });
+  const controller = new AbortController();
+  const cancelled = guard.executeTool("patch_chapter_text", "cancelled", { bookId: "same" }, async () => {
+    executions += 1;
+    return "cancelled";
+  }, controller.signal);
+  await Promise.resolve();
+  await Promise.resolve();
+  controller.abort();
+  releaseFirst();
+  await expect(first).resolves.toBe("first");
+  await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+  expect(executions).toBe(1);
+});
+
+it("cleans production tracking when a queued call is rejected by the budget", async () => {
+  const guard = new SessionLoopGuard("same");
+  const failedResult = { details: { bookId: "same", chapterNumber: 1, status: "failed", stage: "validation" } };
+  for (const id of ["failed-1", "failed-2"]) {
+    guard.observe({ type: "tool_execution_start", toolCallId: id, toolName: "sub_agent", args: { agent: "writer", bookId: "same" } } as any);
+    guard.observe({ type: "tool_execution_end", toolCallId: id, toolName: "sub_agent", isError: false, result: failedResult } as any);
+  }
+  guard.observe({ type: "tool_execution_start", toolCallId: "blocked", toolName: "sub_agent", args: { agent: "writer", bookId: "same" } } as any);
+  await expect(guard.executeTool("sub_agent", "blocked", { agent: "writer", bookId: "same" }, async () => "unreachable"))
+    .rejects.toThrow(/failed 2 times/);
+
+  // A late event for the rejected call must not add a third failure.
+  guard.observe({ type: "tool_execution_end", toolCallId: "blocked", toolName: "sub_agent", isError: false, result: failedResult } as any);
+  expect(() => guard.beforeToolExecution("sub_agent", { agent: "writer", bookId: "same" }))
+    .toThrow(/failed 2 times/);
+});
+
+it("cleans production tracking when an unbooked production call is cancelled", async () => {
+  const guard = new SessionLoopGuard();
+  const failedResult = { details: { chapterNumber: 1, status: "failed", stage: "validation" } };
+  guard.observe({ type: "tool_execution_start", toolCallId: "failed", toolName: "sub_agent", args: { agent: "writer" } } as any);
+  guard.observe({ type: "tool_execution_end", toolCallId: "failed", toolName: "sub_agent", isError: false, result: failedResult } as any);
+  const controller = new AbortController();
+  controller.abort();
+  guard.observe({ type: "tool_execution_start", toolCallId: "cancelled", toolName: "sub_agent", args: { agent: "writer" } } as any);
+  await expect(guard.executeTool("sub_agent", "cancelled", { agent: "writer" }, async () => "unreachable", controller.signal))
+    .rejects.toMatchObject({ name: "AbortError" });
+
+  // A late failure event for the cancelled call must not consume the second budget slot.
+  guard.observe({ type: "tool_execution_end", toolCallId: "cancelled", toolName: "sub_agent", isError: false, result: failedResult } as any);
   expect(() => guard.beforeModelCall()).not.toThrow();
 });
 

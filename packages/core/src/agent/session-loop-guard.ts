@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
-import { operationResultFailed, productionOperation } from "./operation-policy.js";
+import { mutationBookId, operationResultFailed, productionOperation } from "./operation-policy.js";
 
 const MAX_MODEL_CALLS = 32;
 const MAX_IDENTICAL_FAILURES = 3;
@@ -22,13 +22,18 @@ function fingerprint(value: unknown): string {
 
 /** Per-user-turn guard, independent of transformed/compressed model history. */
 export class SessionLoopGuard {
+  private readonly activeBookId: string | null;
   private modelCalls = 0;
   private pending = new Map<string, string>();
   private failures = new Map<string, { name: string; count: number }>();
   private reads = new Map<string, { name: string; result: string; count: number }>();
   private productionCalls = new Map<string, Record<string, unknown>>();
   private productionFailures = new Map<string, { count: number; candidateId?: string }>();
-  private productionQueue: Promise<unknown> = Promise.resolve();
+  private mutationQueues = new Map<string, Promise<void>>();
+
+  constructor(activeBookId: string | null = null) {
+    this.activeBookId = activeBookId;
+  }
 
   reset(): void {
     this.modelCalls = 0;
@@ -44,10 +49,17 @@ export class SessionLoopGuard {
     if (productionOperation(name, args)) this.assertProductionBudget();
   }
 
-  async executeTool<T>(name: string, id: string, args: Record<string, unknown>, execute: () => Promise<T>): Promise<T> {
-    if (!productionOperation(name, args)) return execute();
-    const task = this.productionQueue.then(async () => {
-      this.beforeToolExecution(name, args);
+  async executeTool<T>(
+    name: string,
+    id: string,
+    args: Record<string, unknown>,
+    execute: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const bookId = mutationBookId(name, args, this.activeBookId);
+    if (!bookId) {
+      if (!productionOperation(name, args)) return execute();
+      this.preflightToolExecution(id, name, args, signal);
       try {
         const result = await execute();
         this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result, isError: false } as AgentEvent);
@@ -61,9 +73,64 @@ export class SessionLoopGuard {
         this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result: undefined, isError: true } as unknown as AgentEvent);
         throw error;
       }
+    }
+
+    const previous = this.mutationQueues.get(bookId) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(async () => {
+      // A cancelled task may have waited behind another mutation. It must not
+      // enter the tool body after it reaches the front of the queue.
+      this.preflightToolExecution(id, name, args, signal);
+      try {
+        const result = await execute();
+        if (productionOperation(name, args)) {
+          this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result, isError: false } as AgentEvent);
+        }
+        return result;
+      } catch (error) {
+        if ((error as Error)?.name === "AbortError") {
+          this.pending.delete(id);
+          this.productionCalls.delete(id);
+          throw error;
+        }
+        if (productionOperation(name, args)) {
+          this.observe({ type: "tool_execution_end", toolCallId: id, toolName: name, result: undefined, isError: true } as unknown as AgentEvent);
+        }
+        throw error;
+      }
     });
-    this.productionQueue = task.catch(() => undefined);
+
+    const tail = task.then(() => undefined, () => undefined);
+    this.mutationQueues.set(bookId, tail);
+    void tail.then(() => {
+      if (this.mutationQueues.get(bookId) === tail) this.mutationQueues.delete(bookId);
+    });
     return task;
+  }
+
+  private preflightToolExecution(
+    id: string,
+    name: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+  ): void {
+    try {
+      this.throwIfAborted(signal);
+      this.beforeToolExecution(name, args);
+    } catch (error) {
+      // The host may still deliver a tool_execution_end after a rejected
+      // wrapper promise. Do not let that late event create a false failure.
+      this.pending.delete(id);
+      this.productionCalls.delete(id);
+      throw error;
+    }
+  }
+
+  private throwIfAborted(signal: AbortSignal | undefined): void {
+    if (!signal?.aborted) return;
+    if (typeof signal.throwIfAborted === "function") signal.throwIfAborted();
+    const error = new Error("The queued mutation was cancelled before execution.");
+    error.name = "AbortError";
+    throw error;
   }
 
   private assertProductionBudget(): void {

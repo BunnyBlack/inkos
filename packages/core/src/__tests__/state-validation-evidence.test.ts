@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { StateValidatorAgent } from "../agents/state-validator.js";
+import { checkValidationEvidence, resolveEvidenceQuote, type GroundedValidationIssue } from "../agents/state-validation-evidence.js";
 
 const chapter = "Mira noticed the hidden seal. She did not answer the offer.";
 const state = "Mira noticed the hidden seal.";
@@ -15,6 +16,91 @@ function issue(overrides = {}) {
     evidence: [{ source: "chapter", quote: "She did not answer the offer." }, { source: "candidate-state", quote: "Mira agreed." }], ...overrides };
 }
 describe("grounded validator feedback", () => {
+  it.each([
+    ["Mira \n  agreed.", "Mira agreed."],
+    ["甲。 \r\n乙。", "甲。 乙。"],
+  ])("preserves matching whitespace prefixes when resolving layout: %s", (source, quote) => {
+    expect(resolveEvidenceQuote(source, quote)).toMatchObject({ text: source, mode: "layout" });
+  });
+  it("maps only the requested span and rejects two valid layout locations", () => {
+    expect(resolveEvidenceQuote("前文。\n甲。\n乙。", "甲。乙。"))
+      .toEqual({ start: 4, end: 9, text: "甲。\n乙。", mode: "layout" });
+    expect(resolveEvidenceQuote("甲。\n乙。甲。\r\n乙。", "甲。乙。")).toBeUndefined();
+    expect(resolveEvidenceQuote("not  now", "not now")).toBeUndefined();
+  });
+  it("resolves exact and layout-only quotes to the complete original source span", () => {
+    expect(resolveEvidenceQuote("甲走上楼梯。乙留在门口。", "甲走上楼梯。乙留在门口。"))
+      .toEqual({ start: 0, end: 12, text: "甲走上楼梯。乙留在门口。", mode: "exact" });
+    expect(resolveEvidenceQuote("甲走上楼梯。\r\n\r\n乙留在门口。", "甲走上楼梯。乙留在门口。"))
+      .toMatchObject({ text: "甲走上楼梯。\r\n\r\n乙留在门口。", mode: "layout" });
+    expect(resolveEvidenceQuote("甲走上楼梯。\r\n  乙留在门口。", "甲走上楼梯。\n乙留在门口。"))
+      .toMatchObject({ text: "甲走上楼梯。\r\n  乙留在门口。", mode: "layout" });
+    expect(resolveEvidenceQuote("not\r\n now", "not now"))
+      .toMatchObject({ text: "not\r\n now", mode: "layout" });
+  });
+
+  it.each([
+    ["not now", "notnow"],
+    ["Mira did not agree.", "Mira did agree."],
+    ["甲走上楼梯。", "甲走上楼梯!"],
+    ["甲没\n同意。", "甲没同意。"],
+    ["甲离开。未答应。乙留下。", "甲离开。乙留下。"],
+    ["Echo.\r\nEcho.\r\nEcho.", "Echo.Echo."],
+  ])("rejects quote changes, omitted content, or ambiguous matches: %s -> %s", (source, quote) => {
+    expect(resolveEvidenceQuote(source, quote)).toBeUndefined();
+  });
+
+  it("accepts internal conflicts only with two distinct candidate quotes and normalizes layout evidence", () => {
+    const issues = [{
+      category: "candidate-conflict", description: "Candidate state disagrees with candidate hooks.", blocking: true,
+      basis: "explicit" as const, kind: "internal-conflict" as const,
+      rationale: "The candidate state and candidate hooks contain incompatible explicit facts.",
+      evidence: [
+        { source: "candidate-state" as const, quote: "状态：门口" },
+        { source: "candidate-state" as const, quote: "状态：楼梯" },
+      ],
+    }];
+    const normalized = checkValidationEvidence(issues, {
+      chapter: "正文",
+      "candidate-state": "状态：门口\r\n状态：楼梯",
+      "candidate-hooks": "候选钩子",
+      baseline: "基线",
+      authority: "权威",
+    });
+    expect(normalized[0]?.evidence[0]).toMatchObject({ quote: "状态：门口" });
+  });
+
+  it.each([
+    [[{ source: "candidate-state", quote: "状态：门口" }]],
+    [[{ source: "candidate-state", quote: "状态：门口" }, { source: "candidate-state", quote: "状态：门口" }]],
+  ])("rejects internal conflicts without two distinct candidate evidence quotes", (rawEvidence) => {
+    const evidence = rawEvidence as GroundedValidationIssue["evidence"];
+    const issue = {
+      category: "candidate-conflict", description: "Candidate conflict", blocking: true,
+      basis: "explicit" as const, kind: "internal-conflict" as const,
+      rationale: "Two candidate facts are required.", evidence,
+    };
+    expect(() => checkValidationEvidence([issue], {
+      chapter: "正文", "candidate-state": "状态：门口", "candidate-hooks": "状态：楼梯",
+      baseline: "基线", authority: "权威",
+    })).toThrow(/internal-conflict|candidate evidence/i);
+  });
+
+  it.each(["inference", "ambiguous"] as const)("rejects internal conflicts with basis %s", (basis) => {
+    const issue = {
+      category: "candidate-conflict", description: "Candidate conflict", blocking: true,
+      basis, kind: "internal-conflict" as const,
+      rationale: "Candidate facts are only inferred.", evidence: [
+        { source: "candidate-state" as const, quote: "状态：门口" },
+        { source: "candidate-hooks" as const, quote: "状态：楼梯" },
+      ],
+    };
+    expect(() => checkValidationEvidence([issue], {
+      chapter: "正文", "candidate-state": "状态：门口", "candidate-hooks": "状态：楼梯",
+      baseline: "基线", authority: "权威",
+    })).toThrow(/explicit|inference|ambiguity/i);
+  });
+
   it("completes legacy blocking evidence with only one validator correction", async () => {
     const { agent, chat } = setup("REPAIR\n[missing] Missing agreement", "PASS");
     const result = await agent.validate(chapter, 1, "old", state, "", "", "en");

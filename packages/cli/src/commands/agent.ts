@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { PipelineRunner, runAgentSession } from "@actalk/inkos-core";
+import { hasFailedOperationOutcomes, PipelineRunner, runAgentSession } from "@actalk/inkos-core";
 import { buildPipelineConfig, loadConfig, createClient, findProjectRoot, resolveBookId, resolveContext, log, logError } from "../utils.js";
 
 export const agentCommand = new Command("agent")
@@ -12,6 +12,7 @@ export const agentCommand = new Command("agent")
   .option("--json", "Output JSON (suppress progress messages)")
   .option("--quiet", "Suppress non-JSON console output")
   .action(async (instruction: string, opts) => {
+    let exitingAfterResult = false;
     try {
       const config = await loadConfig();
       const client = createClient(config);
@@ -60,14 +61,39 @@ export const agentCommand = new Command("agent")
         fullInstruction,
       );
 
-      if (result.errorMessage) throw new Error(result.errorMessage);
+      const candidateIds = [...new Set(result.messages
+        .map((message: any) => message?.details?.candidateId)
+        .filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0))];
+      const operationFailure = hasFailedOperationOutcomes(result.operationOutcomes)
+        ? result.operationOutcomes
+          ?.filter((outcome) => outcome.status === "failed" || outcome.status === "blocked")
+          .map((outcome) => [
+            outcome.status,
+            outcome.chapterNumber === undefined ? undefined : `chapter ${outcome.chapterNumber}`,
+            outcome.attemptId ? `attempt ${outcome.attemptId}` : undefined,
+            outcome.reasonCode ? outcome.reasonCode : undefined,
+          ].filter((value): value is string => Boolean(value)).join(" "))
+          .join(", ")
+        : undefined;
+      const failure = result.errorMessage ?? (operationFailure
+        ? `Business operation did not complete: ${operationFailure}`
+        : undefined);
 
       if (opts.json) {
-        log(JSON.stringify({ result }));
-      } else if (!opts.quiet && result.responseText.trim()) {
-        log(result.responseText);
+        log(JSON.stringify({ result, ...(failure ? { error: failure } : {}), ...(candidateIds.length > 0 ? { candidateIds } : {}) }));
+      } else {
+        if (!opts.quiet && result.responseText.trim()) log(result.responseText);
+        if (failure) {
+          logError(`Agent failed: ${failure}${candidateIds.length > 0 ? ` Candidate: ${candidateIds.join(", ")}` : ""}`);
+        }
+      }
+      if (failure) {
+        exitingAfterResult = true;
+        process.exit(1);
+        return;
       }
     } catch (e) {
+      if (exitingAfterResult) throw e;
       if (opts.json) {
         log(JSON.stringify({ error: String(e) }));
       } else {
